@@ -1,5 +1,5 @@
 fastapi[all]==0.104.1
 httpx==0.25.2
 aioimaplib==2.0.1
-pydantic[email]==2.5.0
+pydantic[email]>=2.10,<3
 requests==2.31.0 

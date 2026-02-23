@@ -403,7 +403,25 @@ async def get_access_token(credentials: AccountCredentials) -> str:
             return access_token
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP {e.response.status_code} error getting access token for {credentials.email}: {e}")
+        error_code = None
+        error_description = None
+        response_preview = e.response.text[:800]
+
+        try:
+            error_payload = e.response.json()
+            error_code = error_payload.get('error')
+            error_description = error_payload.get('error_description')
+        except Exception:
+            error_payload = None
+
+        logger.error(
+            "HTTP %s error getting access token for %s: error=%s description=%s response=%s",
+            e.response.status_code,
+            credentials.email,
+            error_code,
+            error_description,
+            response_preview
+        )
         raise
     except httpx.RequestError as e:
         logger.error(f"Request error getting access token for {credentials.email}: {e}")

@@ -33,7 +33,7 @@
 ### 🔧 技术特性
 
 - **🏗️ 现代架构**: FastAPI + HTML5 + CSS3 + JavaScript
-- **⚡ 高性能**: IMAP连接池、智能缓存机制
+- **⚡ 高性能**: IMAP连接池 + Graph API、智能缓存机制
 - **🎯 用户友好**: 响应式设计、实时通知、键盘快捷键
 - **🔒 安全可靠**: OAuth2认证、错误处理、连接管理
 - **📱 移动适配**: 支持移动设备访问
@@ -45,7 +45,7 @@
 
 - Python 3.8+
 - 现代浏览器（Chrome、Firefox、Safari、Edge）
-- 网络连接（用于访问Outlook IMAP服务器）
+- 网络连接（用于访问Outlook IMAP和Microsoft Graph服务）
 
 ### 📦 安装依赖
 
@@ -110,7 +110,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 ### 1️⃣ 添加邮箱账户
 
 1. 点击左侧菜单"添加账户"
-2. 填写邮箱地址、刷新令牌和客户端ID
+2. 填写邮箱地址、刷新令牌和客户端ID（系统会自动识别使用 IMAP 或 Graph 模式）
 3. 点击"测试连接"验证配置
 4. 点击"添加账户"完成添加
 
@@ -124,7 +124,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 ### 3️⃣ 批量添加账户
 
 1. 点击左侧菜单"批量添加"
-2. 按格式输入账户信息：`邮箱----密码----刷新令牌----客户端ID`
+2. 按格式输入账户信息（支持两种顺序）：`邮箱----密码----刷新令牌----客户端ID` 或 `邮箱----密码----客户端ID----刷新令牌`
 3. 点击"验证格式"检查数据
 4. 点击"开始批量添加"执行
 
@@ -133,7 +133,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 查看"API管理"页面获取完整的接口文档，支持：
 - 获取邮箱列表：`GET /accounts`
 - 获取邮件列表：`GET /emails/{email_id}`
-- 获取邮件详情：`GET /emails/{email_id}/{message_id}`
+- 获取邮件详情：`GET /emails/{email_id}/{message_id}`（IMAP: `{folder}-{id}`，Graph: `GRAPH-{encoded_id}`）
 
 ## 🚀 部署指南
 

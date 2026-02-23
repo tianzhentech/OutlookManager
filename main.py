@@ -1,7 +1,7 @@
 """
 Outlook邮件管理系统 - 主应用模块
 
-基于FastAPI和IMAP协议的高性能邮件管理系统
+基于FastAPI，支持IMAP和Microsoft Graph的高性能邮件管理系统
 支持多账户管理、邮件查看、搜索过滤等功能
 
 Author: Outlook Manager Team
@@ -9,27 +9,34 @@ Version: 1.0.0
 """
 
 import asyncio
+import base64
 import email
 import imaplib
 import json
 import logging
+import os
 import re
 import socket
+import sqlite3
 import threading
 import time
+import hashlib
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
+from html import escape
 from itertools import groupby
 from pathlib import Path
 from queue import Empty, Queue
 from typing import AsyncGenerator, List, Optional
+from urllib.parse import quote
 
 import httpx
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 
@@ -40,11 +47,28 @@ from pydantic import BaseModel, EmailStr, Field
 # ============================================================================
 
 # 文件路径配置
-ACCOUNTS_FILE = "accounts.json"
+ACCOUNTS_DB_FILE = Path(__file__).resolve().parent / "accounts.db"
 
 # OAuth2配置
 TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-OAUTH_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+IMAP_OAUTH_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+GRAPH_OAUTH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
+SUPPORTED_AUTH_MODES = {"auto", "imap", "graph"}
+
+# Microsoft Graph配置
+GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
+GRAPH_MESSAGES_URL = f"{GRAPH_API_BASE}/me/messages"
+
+# 管理后台鉴权配置
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me_admin_password").strip()
+ADMIN_ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_ACCESS_TOKEN_TTL_SECONDS", "1800"))
+ADMIN_REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_REFRESH_TOKEN_TTL_SECONDS", "604800"))
+ADMIN_COOKIE_SECURE = os.getenv("ADMIN_COOKIE_SECURE", "false").strip().lower() == "true"
+ADMIN_ACCESS_COOKIE_NAME = "admin_access_token"
+ADMIN_REFRESH_COOKIE_NAME = "admin_refresh_token"
+ADMIN_PROTECTED_API_PREFIXES = ("/accounts", "/emails", "/cache")
+ADMIN_PROTECTED_HTML_PATHS = {"/admin/panel", "/admin/panel/", "/static/index.html"}
+ADMIN_PROTECTED_EXACT_PATHS = {"/api", *ADMIN_PROTECTED_HTML_PATHS}
 
 # IMAP服务器配置
 IMAP_SERVER = "outlook.live.com"
@@ -73,16 +97,20 @@ logger = logging.getLogger(__name__)
 class AccountCredentials(BaseModel):
     """账户凭证模型"""
     email: EmailStr
+    mailbox_password: Optional[str] = None
     refresh_token: str
     client_id: str
+    auth_mode: str = Field(default="auto")
     tags: Optional[List[str]] = Field(default=[])
 
     class Config:
         schema_extra = {
             "example": {
                 "email": "user@outlook.com",
+                "mailbox_password": "mailbox-password",
                 "refresh_token": "0.AXoA...",
                 "client_id": "your-client-id",
+                "auth_mode": "auto",
                 "tags": ["工作", "个人"]
             }
         }
@@ -154,6 +182,7 @@ class AccountInfo(BaseModel):
     """账户信息模型"""
     email_id: str
     client_id: str
+    auth_mode: str = "imap"
     status: str = "active"
     tags: List[str] = []
 
@@ -350,12 +379,13 @@ email_cache = {}  # 邮件列表缓存
 email_count_cache = {}  # 邮件总数缓存，用于检测新邮件
 
 
-def get_cache_key(email: str, folder: str, page: int, page_size: int) -> str:
+def get_cache_key(email: str, auth_mode: str, folder: str, page: int, page_size: int) -> str:
     """
     生成缓存键
 
     Args:
         email: 邮箱地址
+        auth_mode: 认证模式 (imap/graph)
         folder: 文件夹名称
         page: 页码
         page_size: 每页大小
@@ -363,7 +393,7 @@ def get_cache_key(email: str, folder: str, page: int, page_size: int) -> str:
     Returns:
         str: 缓存键
     """
-    return f"{email}:{folder}:{page}:{page_size}"
+    return f"{email}:{auth_mode}:{folder}:{page}:{page_size}"
 
 
 def get_cached_emails(cache_key: str, force_refresh: bool = False):
@@ -428,6 +458,372 @@ def clear_email_cache(email: str = None) -> None:
         email_cache.clear()
         email_count_cache.clear()
         logger.info(f"Cleared all email cache ({cache_count} entries)")
+
+
+def normalize_auth_mode(auth_mode: Optional[str], default: str = "imap") -> str:
+    """标准化认证模式"""
+    if not auth_mode:
+        return default
+
+    normalized = auth_mode.strip().lower()
+    if normalized not in SUPPORTED_AUTH_MODES:
+        return default
+    return normalized
+
+
+def encode_graph_message_id(raw_message_id: str) -> str:
+    """将Graph原始消息ID编码为URL安全的内部message_id"""
+    encoded = base64.urlsafe_b64encode(raw_message_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"GRAPH-{encoded}"
+
+
+def decode_graph_message_id(encoded_message_id: str) -> str:
+    """从内部message_id还原Graph原始消息ID"""
+    if not encoded_message_id.startswith("GRAPH-"):
+        raise HTTPException(status_code=400, detail="Invalid Graph message_id format")
+
+    payload = encoded_message_id[len("GRAPH-"):]
+    if not payload:
+        raise HTTPException(status_code=400, detail="Invalid Graph message_id format")
+
+    padding = "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode(payload + padding).decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Graph message_id encoding")
+
+
+def get_scope_for_auth_mode(auth_mode: str) -> str:
+    """根据认证模式返回scope"""
+    if auth_mode == "graph":
+        return GRAPH_OAUTH_SCOPE
+    return IMAP_OAUTH_SCOPE
+
+
+def get_graph_folders_by_view(folder_view: str) -> List[tuple[str, str]]:
+    """根据页面文件夹视图映射Graph文件夹"""
+    if folder_view == "inbox":
+        return [("inbox", "inbox")]
+    if folder_view == "junk":
+        return [("junk", "junkemail")]
+    return [("inbox", "inbox"), ("junk", "junkemail")]
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """获取SQLite连接"""
+    conn = sqlite3.connect(ACCOUNTS_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def normalize_email(email_id: str) -> str:
+    return email_id.strip().lower()
+
+
+def parse_tags(tags_raw: Optional[str]) -> List[str]:
+    if not tags_raw:
+        return []
+    try:
+        parsed = json.loads(tags_raw)
+        if isinstance(parsed, list):
+            return [str(tag) for tag in parsed if str(tag).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def serialize_tags(tags: Optional[List[str]]) -> str:
+    clean_tags = []
+    if tags:
+        clean_tags = [str(tag).strip() for tag in tags if str(tag).strip()]
+    return json.dumps(clean_tags, ensure_ascii=False)
+
+
+def init_account_db() -> None:
+    """初始化账户数据库"""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    email_id TEXT PRIMARY KEY,
+                    mailbox_password TEXT NOT NULL DEFAULT '',
+                    refresh_token TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    auth_mode TEXT NOT NULL DEFAULT 'imap',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_accounts_mailbox_password
+                ON accounts (mailbox_password)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_accounts_updated_at
+                ON accounts (updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    refresh_token_hash TEXT PRIMARY KEY,
+                    access_token_hash TEXT NOT NULL,
+                    access_expires_at INTEGER NOT NULL,
+                    refresh_expires_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_admin_sessions_refresh_exp
+                ON admin_sessions (refresh_expires_at)
+                """
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to initialize accounts database {ACCOUNTS_DB_FILE}: {e}")
+        raise
+
+
+def hash_admin_token(token: str) -> str:
+    """对管理员token做SHA-256哈希存储"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_admin_password(password: str) -> bool:
+    """校验管理员密码"""
+    expected = ADMIN_PASSWORD
+    provided = (password or "").strip()
+    return bool(expected) and secrets.compare_digest(provided, expected)
+
+
+def create_admin_session_tokens() -> tuple[str, str]:
+    """创建管理员会话并返回(access_token, refresh_token)"""
+    now_ts = int(time.time())
+    access_token = secrets.token_urlsafe(48)
+    refresh_token = secrets.token_urlsafe(64)
+    access_token_hash = hash_admin_token(access_token)
+    refresh_token_hash = hash_admin_token(refresh_token)
+    access_expires_at = now_ts + ADMIN_ACCESS_TOKEN_TTL_SECONDS
+    refresh_expires_at = now_ts + ADMIN_REFRESH_TOKEN_TTL_SECONDS
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO admin_sessions (
+                refresh_token_hash, access_token_hash, access_expires_at, refresh_expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                refresh_token_hash,
+                access_token_hash,
+                access_expires_at,
+                refresh_expires_at,
+            )
+        )
+        conn.commit()
+
+    return access_token, refresh_token
+
+
+def validate_admin_token_pair(access_token: str, refresh_token: str) -> tuple[bool, Optional[str]]:
+    """
+    验证管理员双token。
+    返回 (是否有效, 新access_token[若触发续签])
+    """
+    now_ts = int(time.time())
+    access_hash = hash_admin_token(access_token)
+    refresh_hash = hash_admin_token(refresh_token)
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT access_token_hash, access_expires_at, refresh_expires_at
+            FROM admin_sessions
+            WHERE refresh_token_hash = ?
+            LIMIT 1
+            """,
+            (refresh_hash,)
+        ).fetchone()
+
+        if not row:
+            return False, None
+
+        if int(row["refresh_expires_at"]) <= now_ts:
+            conn.execute(
+                "DELETE FROM admin_sessions WHERE refresh_token_hash = ?",
+                (refresh_hash,)
+            )
+            conn.commit()
+            return False, None
+
+        if not secrets.compare_digest(row["access_token_hash"], access_hash):
+            return False, None
+
+        if int(row["access_expires_at"]) > now_ts:
+            return True, None
+
+        new_access_token = secrets.token_urlsafe(48)
+        conn.execute(
+            """
+            UPDATE admin_sessions
+            SET access_token_hash = ?, access_expires_at = ?, updated_at = datetime('now')
+            WHERE refresh_token_hash = ?
+            """,
+            (
+                hash_admin_token(new_access_token),
+                now_ts + ADMIN_ACCESS_TOKEN_TTL_SECONDS,
+                refresh_hash
+            )
+        )
+        conn.commit()
+        return True, new_access_token
+
+
+def revoke_admin_session(refresh_token: Optional[str]) -> None:
+    """按refresh_token撤销管理员会话"""
+    if not refresh_token:
+        return
+
+    refresh_hash = hash_admin_token(refresh_token)
+    with get_db_connection() as conn:
+        conn.execute(
+            "DELETE FROM admin_sessions WHERE refresh_token_hash = ?",
+            (refresh_hash,)
+        )
+        conn.commit()
+
+
+def set_admin_auth_cookies(response, access_token: str, refresh_token: str) -> None:
+    """写入管理员access/refresh cookie"""
+    response.set_cookie(
+        key=ADMIN_ACCESS_COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        secure=ADMIN_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+        max_age=ADMIN_ACCESS_TOKEN_TTL_SECONDS
+    )
+    response.set_cookie(
+        key=ADMIN_REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        httponly=True,
+        secure=ADMIN_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+        max_age=ADMIN_REFRESH_TOKEN_TTL_SECONDS
+    )
+
+
+def clear_admin_auth_cookies(response) -> None:
+    """清空管理员鉴权cookie"""
+    response.delete_cookie(ADMIN_ACCESS_COOKIE_NAME, path="/")
+    response.delete_cookie(ADMIN_REFRESH_COOKIE_NAME, path="/")
+
+
+def is_admin_protected_path(path: str) -> bool:
+    """判断路径是否需要管理员鉴权"""
+    if path in ADMIN_PROTECTED_EXACT_PATHS:
+        return True
+    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in ADMIN_PROTECTED_API_PREFIXES)
+
+
+def is_admin_html_path(path: str) -> bool:
+    return path in ADMIN_PROTECTED_HTML_PATHS
+
+
+def build_admin_unauthorized_response(path: str):
+    """未认证时：HTML跳转登录页，API返回401"""
+    if is_admin_html_path(path):
+        return RedirectResponse(url="/admin", status_code=303)
+    return JSONResponse(status_code=401, content={"detail": "Admin authentication required"})
+
+
+def render_admin_login_page(error_message: Optional[str] = None) -> str:
+    """管理员登录页"""
+    error_html = ""
+    if error_message:
+        error_html = f'<div class="auth-error">{escape(error_message)}</div>'
+
+    return f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>后台登录</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/auth-pages.css" />
+</head>
+<body class="auth-page auth-page-admin">
+  <div class="auth-card">
+    <div class="auth-chip"><span class="auth-dot"></span>Outlook Manager Console</div>
+    <h2>后台管理登录</h2>
+    <p>请输入管理员密码。</p>
+    {error_html}
+    <form class="auth-form" method="post" action="/admin/auth/login">
+      <label for="password">管理员密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">登录后台</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
+def row_to_credentials(row: sqlite3.Row) -> AccountCredentials:
+    """数据库行转换为凭证对象"""
+    return AccountCredentials(
+        email=row["email_id"],
+        mailbox_password=(row["mailbox_password"] or None),
+        refresh_token=row["refresh_token"],
+        client_id=row["client_id"],
+        auth_mode=normalize_auth_mode(row["auth_mode"], default="imap"),
+        tags=parse_tags(row["tags"])
+    )
+
+
+def get_account_credentials_by_email_and_password(
+    email_id: str,
+    mailbox_password: str
+) -> Optional[AccountCredentials]:
+    """按邮箱+邮箱密码查询账户（用于 /web 路由）"""
+    normalized_email = normalize_email(email_id)
+    normalized_password = mailbox_password.strip()
+
+    if not normalized_email or not normalized_password:
+        return None
+
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
+                FROM accounts
+                WHERE email_id = ? AND mailbox_password = ?
+                LIMIT 1
+                """,
+                (normalized_email, normalized_password)
+            ).fetchone()
+    except Exception as e:
+        logger.error(f"Failed to query account by email/password from sqlite: {e}")
+        return None
+
+    if not row:
+        return None
+    return row_to_credentials(row)
 
 # ============================================================================
 # 邮件处理辅助函数
@@ -539,7 +935,7 @@ def extract_email_content(email_message: email.message.EmailMessage) -> tuple[st
 
 async def get_account_credentials(email_id: str) -> AccountCredentials:
     """
-    从accounts.json文件获取指定邮箱的账户凭证
+    从SQLite获取指定邮箱的账户凭证
 
     Args:
         email_id: 邮箱地址
@@ -548,70 +944,84 @@ async def get_account_credentials(email_id: str) -> AccountCredentials:
         AccountCredentials: 账户凭证对象
 
     Raises:
-        HTTPException: 账户不存在或文件读取失败
+        HTTPException: 账户不存在或读取失败
     """
     try:
-        # 检查账户文件是否存在
-        accounts_path = Path(ACCOUNTS_FILE)
-        if not accounts_path.exists():
-            logger.warning(f"Accounts file {ACCOUNTS_FILE} not found")
-            raise HTTPException(status_code=404, detail="No accounts configured")
+        normalized_email = normalize_email(email_id)
+        if not normalized_email:
+            raise HTTPException(status_code=400, detail="Invalid email_id")
 
-        # 读取账户数据
-        with open(accounts_path, 'r', encoding='utf-8') as f:
-            accounts = json.load(f)
+        with get_db_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
+                FROM accounts
+                WHERE email_id = ?
+                LIMIT 1
+                """,
+                (normalized_email,)
+            ).fetchone()
 
-        # 检查指定邮箱是否存在
-        if email_id not in accounts:
-            logger.warning(f"Account {email_id} not found in accounts file")
-            raise HTTPException(status_code=404, detail=f"Account {email_id} not found")
+        if not row:
+            logger.warning(f"Account {normalized_email} not found in sqlite")
+            raise HTTPException(status_code=404, detail=f"Account {normalized_email} not found")
 
-        # 验证账户数据完整性
-        account_data = accounts[email_id]
-        required_fields = ['refresh_token', 'client_id']
-        missing_fields = [field for field in required_fields if not account_data.get(field)]
-
-        if missing_fields:
-            logger.error(f"Account {email_id} missing required fields: {missing_fields}")
-            raise HTTPException(status_code=500, detail="Account configuration incomplete")
-
-        return AccountCredentials(
-            email=email_id,
-            refresh_token=account_data['refresh_token'],
-            client_id=account_data['client_id']
-        )
+        return row_to_credentials(row)
 
     except HTTPException:
-        # 重新抛出HTTP异常
         raise
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in accounts file: {e}")
-        raise HTTPException(status_code=500, detail="Accounts file format error")
     except Exception as e:
-        logger.error(f"Unexpected error getting account credentials for {email_id}: {e}")
+        logger.error(f"Unexpected error getting account credentials for {email_id} from sqlite: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def save_account_credentials(email_id: str, credentials: AccountCredentials) -> None:
-    """保存账户凭证到accounts.json"""
+    """保存账户凭证到SQLite"""
     try:
-        accounts = {}
-        if Path(ACCOUNTS_FILE).exists():
-            with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
-                accounts = json.load(f)
+        normalized_email = normalize_email(email_id)
+        if not normalized_email:
+            raise HTTPException(status_code=400, detail="Invalid email_id")
 
-        accounts[email_id] = {
-            'refresh_token': credentials.refresh_token,
-            'client_id': credentials.client_id,
-            'tags': credentials.tags if hasattr(credentials, 'tags') else []
-        }
+        normalized_auth_mode = normalize_auth_mode(credentials.auth_mode, default="imap")
+        mailbox_password = (credentials.mailbox_password or "").strip()
+        tags_json = serialize_tags(credentials.tags if hasattr(credentials, "tags") else [])
 
-        with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(accounts, f, indent=2, ensure_ascii=False)
+        with get_db_connection() as conn:
+            if not mailbox_password:
+                existing = conn.execute(
+                    "SELECT mailbox_password FROM accounts WHERE email_id = ?",
+                    (normalized_email,)
+                ).fetchone()
+                if existing and existing["mailbox_password"]:
+                    mailbox_password = existing["mailbox_password"]
 
-        logger.info(f"Account credentials saved for {email_id}")
+            conn.execute(
+                """
+                INSERT INTO accounts (
+                    email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(email_id) DO UPDATE SET
+                    mailbox_password = excluded.mailbox_password,
+                    refresh_token = excluded.refresh_token,
+                    client_id = excluded.client_id,
+                    auth_mode = excluded.auth_mode,
+                    tags = excluded.tags,
+                    updated_at = datetime('now')
+                """,
+                (
+                    normalized_email,
+                    mailbox_password,
+                    credentials.refresh_token,
+                    credentials.client_id,
+                    normalized_auth_mode,
+                    tags_json
+                )
+            )
+            conn.commit()
+
+        logger.info(f"Account credentials saved to sqlite for {normalized_email}")
     except Exception as e:
-        logger.error(f"Error saving account credentials: {e}")
+        logger.error(f"Error saving account credentials to sqlite: {e}")
         raise HTTPException(status_code=500, detail="Failed to save account")
 
 
@@ -623,64 +1033,54 @@ async def get_all_accounts(
 ) -> AccountListResponse:
     """获取所有已加载的邮箱账户列表，支持分页和搜索"""
     try:
-        if not Path(ACCOUNTS_FILE).exists():
-            return AccountListResponse(
-                total_accounts=0, 
-                page=page, 
-                page_size=page_size, 
-                total_pages=0, 
-                accounts=[]
-            )
+        where_conditions = ["1=1"]
+        where_params: List[str] = []
 
-        with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
-            accounts_data = json.load(f)
-
-        all_accounts = []
-        for email_id, account_info in accounts_data.items():
-            # 验证账户状态（可选：检查token是否有效）
-            status = "active"
-            try:
-                # 简单验证：检查必要字段是否存在
-                if not account_info.get('refresh_token') or not account_info.get('client_id'):
-                    status = "invalid"
-            except Exception:
-                status = "error"
-
-            account = AccountInfo(
-                email_id=email_id,
-                client_id=account_info.get('client_id', ''),
-                status=status,
-                tags=account_info.get('tags', [])
-            )
-            all_accounts.append(account)
-
-        # 应用搜索过滤
-        filtered_accounts = all_accounts
-        
-        # 邮箱账号模糊搜索
         if email_search:
-            email_search_lower = email_search.lower()
-            filtered_accounts = [
-                acc for acc in filtered_accounts 
-                if email_search_lower in acc.email_id.lower()
-            ]
-        
-        # 标签模糊搜索
-        if tag_search:
-            tag_search_lower = tag_search.lower()
-            filtered_accounts = [
-                acc for acc in filtered_accounts 
-                if any(tag_search_lower in tag.lower() for tag in acc.tags)
-            ]
+            where_conditions.append("email_id LIKE ?")
+            where_params.append(f"%{email_search.strip().lower()}%")
 
-        # 计算分页信息
-        total_accounts = len(filtered_accounts)
+        if tag_search:
+            where_conditions.append("LOWER(tags) LIKE ?")
+            where_params.append(f"%{tag_search.strip().lower()}%")
+
+        where_sql = " AND ".join(where_conditions)
+        offset = (page - 1) * page_size
+
+        with get_db_connection() as conn:
+            total_accounts = conn.execute(
+                f"SELECT COUNT(*) AS total FROM accounts WHERE {where_sql}",
+                where_params
+            ).fetchone()["total"]
+
+            rows = conn.execute(
+                f"""
+                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
+                FROM accounts
+                WHERE {where_sql}
+                ORDER BY updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                where_params + [page_size, offset]
+            ).fetchall()
+
         total_pages = (total_accounts + page_size - 1) // page_size if total_accounts > 0 else 0
-        
-        # 应用分页
-        start_index = (page - 1) * page_size
-        end_index = start_index + page_size
-        paginated_accounts = filtered_accounts[start_index:end_index]
+
+        paginated_accounts: List[AccountInfo] = []
+        for row in rows:
+            status = "active"
+            if not row["refresh_token"] or not row["client_id"]:
+                status = "invalid"
+
+            paginated_accounts.append(
+                AccountInfo(
+                    email_id=row["email_id"],
+                    client_id=row["client_id"],
+                    auth_mode=normalize_auth_mode(row["auth_mode"], default="imap"),
+                    status=status,
+                    tags=parse_tags(row["tags"])
+                )
+            )
 
         return AccountListResponse(
             total_accounts=total_accounts,
@@ -690,11 +1090,8 @@ async def get_all_accounts(
             accounts=paginated_accounts
         )
 
-    except json.JSONDecodeError:
-        logger.error("Failed to parse accounts.json")
-        raise HTTPException(status_code=500, detail="Failed to read accounts file")
     except Exception as e:
-        logger.error(f"Error getting accounts list: {e}")
+        logger.error(f"Error getting accounts list from sqlite: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -702,12 +1099,13 @@ async def get_all_accounts(
 # OAuth2令牌管理模块
 # ============================================================================
 
-async def get_access_token(credentials: AccountCredentials) -> str:
+async def get_access_token(credentials: AccountCredentials, auth_mode: str = "imap") -> str:
     """
     使用refresh_token获取access_token
 
     Args:
         credentials: 账户凭证信息
+        auth_mode: 认证模式（imap/graph）
 
     Returns:
         str: OAuth2访问令牌
@@ -715,12 +1113,15 @@ async def get_access_token(credentials: AccountCredentials) -> str:
     Raises:
         HTTPException: 令牌获取失败
     """
+    normalized_mode = normalize_auth_mode(auth_mode, default="imap")
+    oauth_scope = get_scope_for_auth_mode(normalized_mode)
+
     # 构建OAuth2请求数据
     token_request_data = {
         'client_id': credentials.client_id,
         'grant_type': 'refresh_token',
         'refresh_token': credentials.refresh_token,
-        'scope': OAUTH_SCOPE
+        'scope': oauth_scope
     }
 
     try:
@@ -734,167 +1135,202 @@ async def get_access_token(credentials: AccountCredentials) -> str:
             access_token = token_data.get('access_token')
 
             if not access_token:
-                logger.error(f"No access token in response for {credentials.email}")
+                logger.error(f"No access token in response for {credentials.email} with mode={normalized_mode}")
                 raise HTTPException(
                     status_code=401,
-                    detail="Failed to obtain access token from response"
+                    detail=f"Failed to obtain access token from response ({normalized_mode})"
                 )
 
-            logger.info(f"Successfully obtained access token for {credentials.email}")
+            logger.info(f"Successfully obtained access token for {credentials.email} with mode={normalized_mode}")
             return access_token
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP {e.response.status_code} error getting access token for {credentials.email}: {e}")
+        error_code = None
+        error_description = None
+        response_preview = e.response.text[:800]
+
+        try:
+            error_payload = e.response.json()
+            error_code = error_payload.get('error')
+            error_description = error_payload.get('error_description')
+        except Exception:
+            error_payload = None
+
+        logger.error(
+            "HTTP %s error getting access token for %s (mode=%s, scope=%s): error=%s description=%s response=%s",
+            e.response.status_code,
+            credentials.email,
+            normalized_mode,
+            oauth_scope,
+            error_code,
+            error_description,
+            response_preview
+        )
+
         if e.response.status_code == 400:
-            raise HTTPException(status_code=401, detail="Invalid refresh token or client credentials")
+            detail = f"Microsoft token endpoint rejected the request ({normalized_mode})"
+            if error_code:
+                detail += f": {error_code}"
+            if error_description:
+                detail += f" ({error_description})"
+            raise HTTPException(status_code=401, detail=detail)
         else:
-            raise HTTPException(status_code=401, detail="Authentication failed")
+            raise HTTPException(status_code=401, detail=f"Authentication failed ({normalized_mode})")
     except httpx.RequestError as e:
-        logger.error(f"Request error getting access token for {credentials.email}: {e}")
+        logger.error(f"Request error getting access token for {credentials.email} with mode={normalized_mode}: {e}")
         raise HTTPException(status_code=500, detail="Network error during token acquisition")
     except Exception as e:
-        logger.error(f"Unexpected error getting access token for {credentials.email}: {e}")
+        logger.error(f"Unexpected error getting access token for {credentials.email} with mode={normalized_mode}: {e}")
         raise HTTPException(status_code=500, detail="Token acquisition failed")
 
 
+async def resolve_account_auth_mode(credentials: AccountCredentials) -> str:
+    """
+    自动解析账户认证模式。
+    auto模式下优先尝试IMAP，失败后回退Graph。
+    """
+    requested_mode = normalize_auth_mode(credentials.auth_mode, default="auto")
+
+    if requested_mode in {"imap", "graph"}:
+        await get_access_token(credentials, requested_mode)
+        return requested_mode
+
+    imap_error = None
+    try:
+        await get_access_token(credentials, "imap")
+        return "imap"
+    except HTTPException as e:
+        imap_error = e
+
+    try:
+        await get_access_token(credentials, "graph")
+        return "graph"
+    except HTTPException as graph_error:
+        raise HTTPException(
+            status_code=401,
+            detail=f"IMAP verification failed: {imap_error.detail}; Graph verification failed: {graph_error.detail}"
+        )
+
+
 # ============================================================================
-# IMAP核心服务 - 邮件列表
+# 邮件核心服务 - IMAP / Graph
 # ============================================================================
 
-async def list_emails(credentials: AccountCredentials, folder: str, page: int, page_size: int, force_refresh: bool = False) -> EmailListResponse:
-    """获取邮件列表 - 优化版本"""
-
-    # 检查缓存
-    cache_key = get_cache_key(credentials.email, folder, page, page_size)
+async def list_emails_imap(
+    credentials: AccountCredentials,
+    folder: str,
+    page: int,
+    page_size: int,
+    force_refresh: bool = False
+) -> EmailListResponse:
+    """通过IMAP获取邮件列表"""
+    cache_key = get_cache_key(credentials.email, "imap", folder, page, page_size)
     cached_result = get_cached_emails(cache_key, force_refresh)
     if cached_result:
         return cached_result
 
-    access_token = await get_access_token(credentials)
+    access_token = await get_access_token(credentials, "imap")
 
     def _sync_list_emails():
         imap_client = None
         try:
-            # 从连接池获取连接
             imap_client = imap_pool.get_connection(credentials.email, access_token)
-            
+
             all_emails_data = []
-            
-            # 根据folder参数决定要获取的文件夹
-            folders_to_check = []
             if folder == "inbox":
                 folders_to_check = ["INBOX"]
             elif folder == "junk":
                 folders_to_check = ["Junk"]
-            else:  # folder == "all"
+            else:
                 folders_to_check = ["INBOX", "Junk"]
-            
+
             for folder_name in folders_to_check:
                 try:
-                    # 选择文件夹
                     imap_client.select(f'"{folder_name}"', readonly=True)
-                    
-                    # 搜索所有邮件
                     status, messages = imap_client.search(None, "ALL")
                     if status != 'OK' or not messages or not messages[0]:
                         continue
-                        
+
                     message_ids = messages[0].split()
-                    
-                    # 按日期排序所需的数据（邮件ID和日期）
-                    # 为了避免获取所有邮件的日期，我们假设ID顺序与日期大致相关
-                    message_ids.reverse() # 通常ID越大越新
-                    
+                    message_ids.reverse()
+
                     for msg_id in message_ids:
                         all_emails_data.append({
                             "message_id_raw": msg_id,
                             "folder": folder_name
                         })
-
                 except Exception as e:
                     logger.warning(f"Failed to access folder {folder_name}: {e}")
                     continue
-            
-            # 对所有文件夹的邮件进行统一分页
+
             total_emails = len(all_emails_data)
             start_index = (page - 1) * page_size
             end_index = start_index + page_size
             paginated_email_meta = all_emails_data[start_index:end_index]
 
             email_items = []
-            # 按文件夹分组批量获取
             paginated_email_meta.sort(key=lambda x: x['folder'])
-            
+
             for folder_name, group in groupby(paginated_email_meta, key=lambda x: x['folder']):
                 try:
                     imap_client.select(f'"{folder_name}"', readonly=True)
-                    
                     msg_ids_to_fetch = [item['message_id_raw'] for item in group]
                     if not msg_ids_to_fetch:
                         continue
 
-                    # 批量获取邮件头 - 优化获取字段
                     msg_id_sequence = b','.join(msg_ids_to_fetch)
-                    # 只获取必要的头部信息，减少数据传输
-                    status, msg_data = imap_client.fetch(msg_id_sequence, '(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT DATE FROM MESSAGE-ID)])')
-
+                    status, msg_data = imap_client.fetch(
+                        msg_id_sequence,
+                        '(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT DATE FROM MESSAGE-ID)])'
+                    )
                     if status != 'OK':
                         continue
-                    
-                    # 解析批量获取的数据
+
                     for i in range(0, len(msg_data), 2):
+                        if not isinstance(msg_data[i], tuple) or len(msg_data[i]) < 2:
+                            continue
+
                         header_data = msg_data[i][1]
-                        
-                        # 从返回的原始数据中解析出msg_id
-                        # e.g., b'1 (BODY[HEADER.FIELDS (SUBJECT DATE FROM)] {..}'
                         match = re.match(rb'(\d+)\s+\(', msg_data[i][0])
                         if not match:
                             continue
                         fetched_msg_id = match.group(1)
 
                         msg = email.message_from_bytes(header_data)
-                        
                         subject = decode_header_value(msg.get('Subject', '(No Subject)'))
                         from_email = decode_header_value(msg.get('From', '(Unknown Sender)'))
                         date_str = msg.get('Date', '')
-                        
+
                         try:
                             date_obj = parsedate_to_datetime(date_str) if date_str else datetime.now()
                             formatted_date = date_obj.isoformat()
-                        except:
-                            date_obj = datetime.now()
-                            formatted_date = date_obj.isoformat()
-                        
-                        message_id = f"{folder_name}-{fetched_msg_id.decode()}"
-                        
-                        # 提取发件人首字母
+                        except Exception:
+                            formatted_date = datetime.now().isoformat()
+
                         sender_initial = "?"
                         if from_email:
-                            # 尝试提取邮箱用户名的首字母
                             email_match = re.search(r'([a-zA-Z])', from_email)
                             if email_match:
                                 sender_initial = email_match.group(1).upper()
-                        
-                        email_item = EmailItem(
-                            message_id=message_id,
-                            folder=folder_name,
-                            subject=subject,
-                            from_email=from_email,
-                            date=formatted_date,
-                            is_read=False,  # 简化处理，实际可通过IMAP flags判断
-                            has_attachments=False,  # 简化处理，实际需要检查邮件结构
-                            sender_initial=sender_initial
+
+                        email_items.append(
+                            EmailItem(
+                                message_id=f"{folder_name}-{fetched_msg_id.decode()}",
+                                folder=folder_name,
+                                subject=subject,
+                                from_email=from_email,
+                                date=formatted_date,
+                                is_read=False,
+                                has_attachments=False,
+                                sender_initial=sender_initial
+                            )
                         )
-                        email_items.append(email_item)
 
                 except Exception as e:
                     logger.warning(f"Failed to fetch bulk emails from {folder_name}: {e}")
                     continue
 
-            # 按日期重新排序最终结果
             email_items.sort(key=lambda x: x.date, reverse=True)
-
-            # 归还连接到池中
             imap_pool.return_connection(credentials.email, imap_client)
 
             result = EmailListResponse(
@@ -905,83 +1341,190 @@ async def list_emails(credentials: AccountCredentials, folder: str, page: int, p
                 total_emails=total_emails,
                 emails=email_items
             )
-
-            # 设置缓存
             set_cached_emails(cache_key, result)
-
             return result
 
         except Exception as e:
-            logger.error(f"Error listing emails: {e}")
+            logger.error(f"Error listing IMAP emails: {e}")
             if imap_client:
                 try:
-                    # 如果出错，尝试归还连接或关闭
                     if hasattr(imap_client, 'state') and imap_client.state != 'LOGOUT':
                         imap_pool.return_connection(credentials.email, imap_client)
-                    else:
-                        # 连接已断开，从池中移除
-                        pass
-                except:
+                except Exception:
                     pass
             raise HTTPException(status_code=500, detail="Failed to retrieve emails")
-    
-    # 在线程池中运行同步代码
+
     return await asyncio.to_thread(_sync_list_emails)
 
 
-# ============================================================================
-# IMAP核心服务 - 邮件详情
-# ============================================================================
+async def list_emails_graph(
+    credentials: AccountCredentials,
+    folder: str,
+    page: int,
+    page_size: int,
+    force_refresh: bool = False
+) -> EmailListResponse:
+    """通过Graph API获取邮件列表"""
+    cache_key = get_cache_key(credentials.email, "graph", folder, page, page_size)
+    cached_result = get_cached_emails(cache_key, force_refresh)
+    if cached_result:
+        return cached_result
 
-async def get_email_details(credentials: AccountCredentials, message_id: str) -> EmailDetailsResponse:
-    """获取邮件详细内容 - 优化版本"""
-    # 解析复合message_id
+    access_token = await get_access_token(credentials, "graph")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    folders = get_graph_folders_by_view(folder)
+    email_items: List[EmailItem] = []
+    total_emails = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for folder_label, folder_id in folders:
+                # 获取文件夹总数
+                folder_info_url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}"
+                folder_info_resp = await client.get(
+                    folder_info_url,
+                    headers=headers,
+                    params={"$select": "totalItemCount"}
+                )
+                if folder_info_resp.status_code == 404:
+                    continue
+                folder_info_resp.raise_for_status()
+                folder_info = folder_info_resp.json()
+                total_emails += int(folder_info.get("totalItemCount", 0))
+
+                if folder == "all":
+                    query_top = min(max(page * page_size, page_size), 500)
+                    query_skip = 0
+                else:
+                    query_top = min(page_size, 500)
+                    query_skip = max((page - 1) * page_size, 0)
+
+                messages_url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
+                response = await client.get(
+                    messages_url,
+                    headers=headers,
+                    params={
+                        "$top": str(query_top),
+                        "$skip": str(query_skip),
+                        "$orderby": "receivedDateTime desc",
+                        "$select": "id,subject,from,receivedDateTime,isRead,hasAttachments"
+                    }
+                )
+                if response.status_code == 404:
+                    continue
+                response.raise_for_status()
+
+                for message in response.json().get("value", []):
+                    raw_message_id = message.get("id")
+                    if not raw_message_id:
+                        continue
+
+                    from_email = (
+                        message.get("from", {})
+                        .get("emailAddress", {})
+                        .get("address", "(Unknown Sender)")
+                    )
+                    sender_initial = "?"
+                    email_match = re.search(r'([a-zA-Z])', from_email or "")
+                    if email_match:
+                        sender_initial = email_match.group(1).upper()
+
+                    folder_display = "INBOX" if folder_label == "inbox" else "Junk"
+                    received_at = message.get("receivedDateTime") or datetime.now().isoformat()
+
+                    email_items.append(
+                        EmailItem(
+                            message_id=encode_graph_message_id(raw_message_id),
+                            folder=folder_display,
+                            subject=message.get("subject") or "(No Subject)",
+                            from_email=from_email,
+                            date=received_at,
+                            is_read=bool(message.get("isRead", False)),
+                            has_attachments=bool(message.get("hasAttachments", False)),
+                            sender_initial=sender_initial
+                        )
+                    )
+
+        email_items.sort(key=lambda x: x.date, reverse=True)
+
+        if folder == "all":
+            start_index = (page - 1) * page_size
+            end_index = start_index + page_size
+            email_items = email_items[start_index:end_index]
+
+        result = EmailListResponse(
+            email_id=credentials.email,
+            folder_view=folder,
+            page=page,
+            page_size=page_size,
+            total_emails=total_emails,
+            emails=email_items
+        )
+        set_cached_emails(cache_key, result)
+        return result
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Graph API error listing emails for {credentials.email}: {e.response.status_code} {e.response.text[:800]}")
+        if e.response.status_code in {401, 403}:
+            raise HTTPException(status_code=401, detail="Graph authorization failed while retrieving emails")
+        raise HTTPException(status_code=500, detail="Graph API request failed while retrieving emails")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected Graph error listing emails for {credentials.email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve emails")
+
+
+async def list_emails(
+    credentials: AccountCredentials,
+    folder: str,
+    page: int,
+    page_size: int,
+    force_refresh: bool = False
+) -> EmailListResponse:
+    """按账户认证模式获取邮件列表"""
+    auth_mode = normalize_auth_mode(credentials.auth_mode, default="imap")
+    if auth_mode == "graph":
+        return await list_emails_graph(credentials, folder, page, page_size, force_refresh)
+    return await list_emails_imap(credentials, folder, page, page_size, force_refresh)
+
+
+async def get_email_details_imap(credentials: AccountCredentials, message_id: str) -> EmailDetailsResponse:
+    """通过IMAP获取邮件详情"""
     try:
         folder_name, msg_id = message_id.split('-', 1)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid message_id format")
 
-    access_token = await get_access_token(credentials)
+    access_token = await get_access_token(credentials, "imap")
 
     def _sync_get_email_details():
         imap_client = None
         try:
-            # 从连接池获取连接
             imap_client = imap_pool.get_connection(credentials.email, access_token)
-            
-            # 选择正确的文件夹
             imap_client.select(folder_name)
-            
-            # 获取完整邮件内容
             status, msg_data = imap_client.fetch(msg_id, '(RFC822)')
-            
+
             if status != 'OK' or not msg_data:
                 raise HTTPException(status_code=404, detail="Email not found")
-            
-            # 解析邮件
+
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
-            
-            # 提取基本信息
+
             subject = decode_header_value(msg.get('Subject', '(No Subject)'))
             from_email = decode_header_value(msg.get('From', '(Unknown Sender)'))
             to_email = decode_header_value(msg.get('To', '(Unknown Recipient)'))
             date_str = msg.get('Date', '')
-            
-            # 格式化日期
+
             try:
                 if date_str:
                     date_obj = parsedate_to_datetime(date_str)
                     formatted_date = date_obj.isoformat()
                 else:
                     formatted_date = datetime.now().isoformat()
-            except:
+            except Exception:
                 formatted_date = datetime.now().isoformat()
-            
-            # 提取邮件内容
-            body_plain, body_html = extract_email_content(msg)
 
-            # 归还连接到池中
+            body_plain, body_html = extract_email_content(msg)
             imap_pool.return_connection(credentials.email, imap_client)
 
             return EmailDetailsResponse(
@@ -997,18 +1540,89 @@ async def get_email_details(credentials: AccountCredentials, message_id: str) ->
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error getting email details: {e}")
+            logger.error(f"Error getting IMAP email details: {e}")
             if imap_client:
                 try:
-                    # 如果出错，尝试归还连接
                     if hasattr(imap_client, 'state') and imap_client.state != 'LOGOUT':
                         imap_pool.return_connection(credentials.email, imap_client)
-                except:
+                except Exception:
                     pass
             raise HTTPException(status_code=500, detail="Failed to retrieve email details")
-    
-    # 在线程池中运行同步代码
+
     return await asyncio.to_thread(_sync_get_email_details)
+
+
+async def get_email_details_graph(credentials: AccountCredentials, message_id: str) -> EmailDetailsResponse:
+    """通过Graph API获取邮件详情"""
+    raw_message_id = decode_graph_message_id(message_id)
+    access_token = await get_access_token(credentials, "graph")
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{GRAPH_MESSAGES_URL}/{quote(raw_message_id, safe='')}",
+                headers=headers,
+                params={
+                    "$select": "id,subject,from,toRecipients,receivedDateTime,body"
+                }
+            )
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail="Email not found")
+            response.raise_for_status()
+            data = response.json()
+
+            from_email = (
+                data.get("from", {})
+                .get("emailAddress", {})
+                .get("address", "(Unknown Sender)")
+            )
+            recipients = data.get("toRecipients") or []
+            to_email = ", ".join(
+                item.get("emailAddress", {}).get("address", "")
+                for item in recipients
+                if item.get("emailAddress", {}).get("address")
+            ) or "(Unknown Recipient)"
+
+            received_at = data.get("receivedDateTime") or datetime.now().isoformat()
+            body_obj = data.get("body") or {}
+            body_content = body_obj.get("content") or ""
+            body_type = str(body_obj.get("contentType", "")).lower()
+
+            if body_type == "html":
+                body_html = body_content
+                body_plain = None
+            else:
+                body_plain = body_content
+                body_html = None
+
+            return EmailDetailsResponse(
+                message_id=message_id,
+                subject=data.get("subject") or "(No Subject)",
+                from_email=from_email,
+                to_email=to_email,
+                date=received_at,
+                body_plain=body_plain,
+                body_html=body_html
+            )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Graph API error getting email details for {credentials.email}: {e.response.status_code} {e.response.text[:800]}")
+        if e.response.status_code in {401, 403}:
+            raise HTTPException(status_code=401, detail="Graph authorization failed while retrieving email detail")
+        raise HTTPException(status_code=500, detail="Graph API request failed while retrieving email details")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected Graph error getting email details for {credentials.email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve email details")
+
+
+async def get_email_details(credentials: AccountCredentials, message_id: str) -> EmailDetailsResponse:
+    """按账户认证模式获取邮件详情"""
+    auth_mode = normalize_auth_mode(credentials.auth_mode, default="imap")
+    if auth_mode == "graph" or message_id.startswith("GRAPH-"):
+        return await get_email_details_graph(credentials, message_id)
+    return await get_email_details_imap(credentials, message_id)
 
 
 # ============================================================================
@@ -1024,6 +1638,10 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     """
     # 应用启动
     logger.info("Starting Outlook Email Management System...")
+    init_account_db()
+    logger.info(f"SQLite account database initialized at {ACCOUNTS_DB_FILE}")
+    if ADMIN_PASSWORD == "change_me_admin_password":
+        logger.warning("ADMIN_PASSWORD is using default value. Please set ADMIN_PASSWORD in environment.")
     logger.info(f"IMAP connection pool initialized with max_connections={MAX_CONNECTIONS}")
 
     yield
@@ -1037,7 +1655,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="Outlook邮件API服务",
-    description="基于FastAPI和IMAP协议的高性能邮件管理系统",
+    description="基于FastAPI，支持IMAP和Microsoft Graph的高性能邮件管理系统",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -1052,6 +1670,42 @@ app.add_middleware(
 
 # 挂载静态文件服务
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.middleware("http")
+async def admin_auth_middleware(request: Request, call_next):
+    """管理员鉴权中间件：使用 refresh_token + access_token 双token校验"""
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if not is_admin_protected_path(path):
+        return await call_next(request)
+
+    access_token = request.cookies.get(ADMIN_ACCESS_COOKIE_NAME, "")
+    refresh_token = request.cookies.get(ADMIN_REFRESH_COOKIE_NAME, "")
+
+    if not access_token or not refresh_token:
+        response = build_admin_unauthorized_response(path)
+        clear_admin_auth_cookies(response)
+        return response
+
+    try:
+        is_valid, rotated_access_token = validate_admin_token_pair(access_token, refresh_token)
+    except Exception as e:
+        logger.error(f"Failed to validate admin session: {e}")
+        if is_admin_html_path(path):
+            return RedirectResponse(url="/admin", status_code=303)
+        return JSONResponse(status_code=500, content={"detail": "Admin authentication error"})
+
+    if not is_valid:
+        response = build_admin_unauthorized_response(path)
+        clear_admin_auth_cookies(response)
+        return response
+
+    response = await call_next(request)
+    if rotated_access_token:
+        set_admin_auth_cookies(response, rotated_access_token, refresh_token)
+    return response
 
 @app.get("/accounts", response_model=AccountListResponse)
 async def get_accounts(
@@ -1068,15 +1722,16 @@ async def get_accounts(
 async def register_account(credentials: AccountCredentials):
     """注册或更新邮箱账户"""
     try:
-        # 验证凭证有效性
-        await get_access_token(credentials)
+        # 验证凭证并解析认证模式
+        resolved_mode = await resolve_account_auth_mode(credentials)
+        credentials.auth_mode = resolved_mode
 
         # 保存凭证
         await save_account_credentials(credentials.email, credentials)
 
         return AccountResponse(
             email_id=credentials.email,
-            message="Account verified and saved successfully."
+            message=f"Account verified and saved successfully. mode={resolved_mode}"
         )
 
     except HTTPException:
@@ -1096,7 +1751,6 @@ async def get_emails(
 ):
     """获取邮件列表"""
     credentials = await get_account_credentials(email_id)
-    print('credentials:' + str(credentials))
     return await list_emails(credentials, folder, page, page_size, refresh)
 
 
@@ -1156,39 +1810,280 @@ async def get_email_detail(email_id: str, message_id: str):
 async def delete_account(email_id: str):
     """删除邮箱账户"""
     try:
-        # 检查账户是否存在
-        await get_account_credentials(email_id)
-        
-        # 读取现有账户
-        accounts = {}
-        if Path(ACCOUNTS_FILE).exists():
-            with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
-                accounts = json.load(f)
-        
-        # 删除指定账户
-        if email_id in accounts:
-            del accounts[email_id]
-            
-            # 保存更新后的账户列表
-            with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(accounts, f, indent=2, ensure_ascii=False)
-            
-            return AccountResponse(
-                email_id=email_id,
-                message="Account deleted successfully."
+        normalized_email = normalize_email(email_id)
+        with get_db_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM accounts WHERE email_id = ?",
+                (normalized_email,)
             )
-        else:
+            conn.commit()
+
+        if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
-            
+
+        return AccountResponse(
+            email_id=normalized_email,
+            message="Account deleted successfully."
+        )
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting account: {e}")
+        logger.error(f"Error deleting account from sqlite: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete account")
 
-@app.get("/")
+
+def parse_web_credential_path(credential_path: str) -> tuple[str, str]:
+    """解析 /web/{邮箱----密码} 路径参数"""
+    parts = credential_path.split("----", 1)
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid web path format. Use /web/{email}----{mailbox_password}"
+        )
+
+    email_id = parts[0].strip()
+    mailbox_password = parts[1].strip()
+    if not email_id or not mailbox_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid web path format. Email and mailbox password are required"
+        )
+
+    return email_id, mailbox_password
+
+
+async def get_web_account_credentials(credential_path: str) -> AccountCredentials:
+    """按 /web/{邮箱----密码} 从数据库获取账户凭证"""
+    email_id, mailbox_password = parse_web_credential_path(credential_path)
+    credentials = get_account_credentials_by_email_and_password(email_id, mailbox_password)
+    if not credentials:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Account not found in database for {email_id}"
+        )
+    return credentials
+
+
+@app.get("/web/{credential_path}", response_class=HTMLResponse)
+async def web_mailbox(
+    credential_path: str,
+    folder: str = Query("all", regex="^(inbox|junk|all)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    refresh: bool = Query(False)
+):
+    """
+    Web快速查看邮箱。
+    访问路径示例：/web/user@outlook.com----mailbox_password
+    """
+    credentials = await get_web_account_credentials(credential_path)
+    email_response = await list_emails(credentials, folder, page, page_size, refresh)
+
+    encoded_credential = quote(credential_path, safe="")
+    tab_links = [
+        ("all", "全部"),
+        ("inbox", "收件箱"),
+        ("junk", "垃圾箱")
+    ]
+    tabs_html = "".join(
+        f'<a class="wm-tab{" active" if folder == tab_folder else ""}" '
+        f'href="/web/{encoded_credential}?folder={tab_folder}&page=1&page_size={page_size}">{tab_label}</a>'
+        for tab_folder, tab_label in tab_links
+    )
+
+    rows = []
+    for item in email_response.emails:
+        detail_url = f"/web/{encoded_credential}/detail/{quote(item.message_id, safe='')}"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(item.folder)}</td>"
+            f"<td><a class='wm-subject-link' href='{detail_url}'>{escape(item.subject or '(无主题)')}</a></td>"
+            f"<td>{escape(item.from_email or '')}</td>"
+            f"<td>{escape(item.date or '')}</td>"
+            "</tr>"
+        )
+
+    rows_html = "".join(rows) if rows else "<tr><td colspan='4' class='wm-empty'>暂无邮件</td></tr>"
+    prev_page = page - 1 if page > 1 else 1
+    next_page = page + 1
+
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{escape(credentials.email)} 邮件预览</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/web-mail-view.css" />
+</head>
+<body class="webmail-page">
+  <div class="wm-shell">
+    <div class="wm-topbar">
+      <h2 class="wm-title">邮箱：{escape(credentials.email)}</h2>
+      <span class="wm-chip">认证模式：{escape(credentials.auth_mode.upper())}</span>
+    </div>
+    <div class="wm-tabs">{tabs_html}</div>
+    <div class="wm-table-wrap">
+      <table class="wm-table">
+        <thead>
+          <tr>
+            <th>文件夹</th>
+            <th>主题</th>
+            <th>发件人</th>
+            <th>时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </div>
+    <div class="wm-pager">
+      <a class="wm-pager-btn" href="/web/{encoded_credential}?folder={folder}&page={prev_page}&page_size={page_size}">上一页</a>
+      <a class="wm-pager-btn" href="/web/{encoded_credential}?folder={folder}&page={next_page}&page_size={page_size}">下一页</a>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/web/{credential_path}/detail/{message_id:path}", response_class=HTMLResponse)
+async def web_mailbox_detail(credential_path: str, message_id: str):
+    """Web快速查看邮件详情。"""
+    credentials = await get_web_account_credentials(credential_path)
+    detail = await get_email_details(credentials, message_id)
+    encoded_credential = quote(credential_path, safe="")
+
+    body_section = ""
+    if detail.body_html:
+        body_section = f"<div class='wmd-html-content'>{detail.body_html}</div>"
+    else:
+        body_section = f"<pre class='wmd-plain'>{escape(detail.body_plain or '')}</pre>"
+
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{escape(detail.subject or '(无主题)')}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/web-mail-view.css" />
+</head>
+<body class="webmail-detail-page">
+  <div class="wmd-shell">
+    <div class="wmd-header">
+      <a class="wmd-back-link" href="/web/{encoded_credential}">返回邮件列表</a>
+      <h2 class="wmd-title">{escape(detail.subject or '(无主题)')}</h2>
+      <p class="wmd-meta">发件人：{escape(detail.from_email or '')}</p>
+      <p class="wmd-meta">收件人：{escape(detail.to_email or '')}</p>
+      <p class="wmd-meta">时间：{escape(detail.date or '')}</p>
+    </div>
+    <div class="wmd-content">
+      <div class="wmd-paper">
+        {body_section}
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """根路径 - 返回前端页面"""
+    """根路径 - 邮箱密码登录并跳转到 /web/{邮箱----密码}"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>邮箱登录</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/auth-pages.css" />
+</head>
+<body class="auth-page auth-page-web">
+  <div class="auth-card">
+    <div class="auth-chip"><span class="auth-dot"></span>Inbox Quick View</div>
+    <h2>邮箱登录</h2>
+    <p>输入邮箱和邮箱密码，登录后将跳转到邮件网页查看页。</p>
+    <form class="auth-form" id="webLoginForm">
+      <label for="email">邮箱地址</label>
+      <input id="email" type="email" required placeholder="example@outlook.com" />
+      <label for="password">邮箱密码</label>
+      <input id="password" type="text" required placeholder="邮箱密码" />
+      <button type="submit">登录并查看邮件</button>
+    </form>
+    <div class="auth-tip" id="tip">目标路径：/web/{邮箱----邮箱密码}</div>
+  </div>
+
+  <script>
+    const form = document.getElementById("webLoginForm");
+    const tip = document.getElementById("tip");
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      const email = document.getElementById("email").value.trim();
+      const password = document.getElementById("password").value.trim();
+      if (!email || !password) {
+        return;
+      }
+      const credential = `${email}----${password}`;
+      tip.textContent = `目标路径：/web/${credential}`;
+      window.location.href = `/web/${encodeURIComponent(credential)}`;
+    });
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/admin")
+@app.get("/admin/")
+async def admin_login():
+    """后台管理登录页"""
+    return HTMLResponse(content=render_admin_login_page())
+
+
+@app.post("/admin/auth/login")
+async def admin_login_submit(password: str = Form(...)):
+    """管理员密码登录，签发双token"""
+    if not verify_admin_password(password):
+        return HTMLResponse(content=render_admin_login_page("管理员密码错误"), status_code=401)
+
+    access_token, refresh_token = create_admin_session_tokens()
+    response = RedirectResponse(url="/admin/panel", status_code=303)
+    set_admin_auth_cookies(response, access_token, refresh_token)
+    return response
+
+
+@app.get("/admin/auth/logout")
+@app.post("/admin/auth/logout")
+async def admin_logout(request: Request):
+    """管理员登出"""
+    refresh_token = request.cookies.get(ADMIN_REFRESH_COOKIE_NAME)
+    revoke_admin_session(refresh_token)
+    response = RedirectResponse(url="/admin", status_code=303)
+    clear_admin_auth_cookies(response)
+    return response
+
+
+@app.get("/admin/panel")
+@app.get("/admin/panel/")
+async def admin_panel():
+    """后台管理系统入口（需鉴权）"""
     return FileResponse("static/index.html")
 
 @app.delete("/cache/{email_id}")
@@ -1207,7 +2102,7 @@ async def clear_all_cache():
 async def api_status():
     """API状态检查"""
     return {
-        "message": "Outlook邮件API服务正在运行",
+        "message": "Outlook邮件API服务正在运行（IMAP + Graph）",
         "version": "1.0.0",
         "endpoints": {
             "get_accounts": "GET /accounts",
