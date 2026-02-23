@@ -2,6 +2,8 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: outlook-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-outlook_manager}
       POSTGRES_USER: ${POSTGRES_USER:-outlook}
@@ -20,6 +22,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: outlook-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -35,14 +39,16 @@ services:
   outlook-email-client:
     build: .
     container_name: outlook-email-api
+    env_file:
+      - .env
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:8000"
     environment:
       PYTHONUNBUFFERED: "1"
-      HOST: 0.0.0.0
-      PORT: 8000
-      DATABASE_URL: ${DATABASE_URL:-postgresql://outlook:outlook@postgres:5432/outlook_manager}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8000}
+      DATABASE_URL: ${DATABASE_URL_DOCKER:-postgresql://outlook:outlook@postgres:5432/outlook_manager}
+      REDIS_URL: ${REDIS_URL_DOCKER:-redis://redis:6379/0}
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-outlook-manager}
     depends_on:
       postgres:

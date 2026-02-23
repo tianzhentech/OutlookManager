@@ -35,6 +35,16 @@ function buildRefreshTokenButtonId(emailId) {
     return `refresh-token-${String(emailId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
+function parseTagsInput(tagsText) {
+    if (!tagsText) {
+        return [];
+    }
+    return tagsText
+        .split(',')
+        .map(tag => tag.trim())
+        .filter(tag => tag);
+}
+
 function renderTokenRefreshSettings(settings) {
     tokenRefreshSettings = settings || null;
 
@@ -319,6 +329,130 @@ async function testAccountConnection() {
     }
 }
 
+function setAccountInfoFieldsDisabled(disabled) {
+    const fieldIds = [
+        'accountInfoMailboxPassword',
+        'accountInfoRefreshToken',
+        'accountInfoClientId',
+        'accountInfoAuthMode',
+        'accountInfoTags'
+    ];
+
+    fieldIds.forEach(id => {
+        const field = document.getElementById(id);
+        if (field) {
+            field.disabled = disabled;
+        }
+    });
+}
+
+async function openAccountInfoModal(emailId, event = null) {
+    if (event) {
+        event.stopPropagation();
+    }
+
+    const modal = document.getElementById('accountInfoModal');
+    if (!modal || !emailId) {
+        return;
+    }
+
+    currentAccountInfoEmail = emailId;
+    document.getElementById('accountInfoEmail').value = emailId;
+    document.getElementById('accountInfoStatus').value = '加载中...';
+    document.getElementById('accountInfoAtExpires').value = '加载中...';
+    document.getElementById('accountInfoRtExpires').value = '加载中...';
+    document.getElementById('accountInfoAccessToken').value = '加载中...';
+    document.getElementById('accountInfoMailboxPassword').value = '';
+    document.getElementById('accountInfoRefreshToken').value = '';
+    document.getElementById('accountInfoClientId').value = '';
+    document.getElementById('accountInfoAuthMode').value = 'auto';
+    document.getElementById('accountInfoTags').value = '';
+    document.getElementById('accountInfoModalTitle').textContent = `账户信息 - ${emailId}`;
+
+    const saveBtn = document.getElementById('saveAccountInfoBtn');
+    const originalText = saveBtn.innerHTML;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span>⏳</span> 加载中...';
+    setAccountInfoFieldsDisabled(true);
+    modal.style.display = 'flex';
+
+    try {
+        const detail = await apiRequest(`/accounts/${encodeURIComponent(emailId)}`);
+        document.getElementById('accountInfoStatus').value = detail.status || 'unknown';
+        document.getElementById('accountInfoAtExpires').value = formatTokenExpiry(detail.access_token_expires_at);
+        document.getElementById('accountInfoRtExpires').value = formatTokenExpiry(detail.refresh_token_expires_at);
+        document.getElementById('accountInfoAccessToken').value = detail.access_token || '未缓存AT（先取件或刷新RT）';
+        document.getElementById('accountInfoMailboxPassword').value = detail.mailbox_password || '';
+        document.getElementById('accountInfoRefreshToken').value = detail.refresh_token || '';
+        document.getElementById('accountInfoClientId').value = detail.client_id || '';
+        document.getElementById('accountInfoAuthMode').value = detail.auth_mode || 'imap';
+        document.getElementById('accountInfoTags').value = Array.isArray(detail.tags) ? detail.tags.join(',') : '';
+    } catch (error) {
+        showError('加载账户信息失败: ' + error.message);
+        closeAccountInfoModal();
+        return;
+    } finally {
+        setAccountInfoFieldsDisabled(false);
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = originalText;
+    }
+}
+
+function closeAccountInfoModal() {
+    const modal = document.getElementById('accountInfoModal');
+    if (modal) {
+        modal.style.display = 'none';
+    }
+    currentAccountInfoEmail = null;
+}
+
+async function saveAccountInfo() {
+    if (!currentAccountInfoEmail) {
+        closeAccountInfoModal();
+        return;
+    }
+
+    const refreshToken = document.getElementById('accountInfoRefreshToken').value.trim();
+    const clientId = document.getElementById('accountInfoClientId').value.trim();
+    const mailboxPassword = document.getElementById('accountInfoMailboxPassword').value.trim();
+    const authMode = document.getElementById('accountInfoAuthMode').value;
+    const tags = parseTagsInput(document.getElementById('accountInfoTags').value.trim());
+
+    if (!refreshToken || !clientId) {
+        showWarning('refresh_token 和 client_id 不能为空');
+        return;
+    }
+
+    const saveBtn = document.getElementById('saveAccountInfoBtn');
+    const originalText = saveBtn.innerHTML;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span>⏳</span> 保存中...';
+    setAccountInfoFieldsDisabled(true);
+
+    try {
+        await apiRequest(`/accounts/${encodeURIComponent(currentAccountInfoEmail)}`, {
+            method: 'PUT',
+            body: JSON.stringify({
+                mailbox_password: mailboxPassword || null,
+                refresh_token: refreshToken,
+                client_id: clientId,
+                auth_mode: authMode,
+                tags: tags
+            })
+        });
+
+        showSuccess('账户信息已更新');
+        closeAccountInfoModal();
+        await loadAccounts(accountsCurrentPage);
+    } catch (error) {
+        showError('更新账户信息失败: ' + error.message);
+    } finally {
+        setAccountInfoFieldsDisabled(false);
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = originalText;
+    }
+}
+
 async function loadAccounts(page = 1, resetSearch = false) {
     if (resetSearch) {
         // 重置搜索条件
@@ -380,9 +514,13 @@ async function loadAccounts(page = 1, resetSearch = false) {
             const atExpires = formatTokenExpiry(account.access_token_expires_at);
             const rtExpires = formatTokenExpiry(account.refresh_token_expires_at);
             const refreshBtnId = buildRefreshTokenButtonId(account.email_id);
+            const isPinned = openedEmailAccounts.includes(account.email_id);
+            const pinBtnClass = isPinned ? 'btn btn-primary btn-sm' : 'btn btn-secondary btn-sm';
+            const pinBtnIcon = isPinned ? '📌' : '📍';
+            const pinBtnLabel = isPinned ? '取消挂载' : '挂到左侧';
                 
             return `
-                <div class="account-item" onclick="viewAccountEmails('${account.email_id}')" oncontextmenu="showAccountContextMenu(event, '${account.email_id}')">
+                <div class="account-item" onclick="openAccountEmailsInChildWindow('${account.email_id}')" oncontextmenu="showAccountContextMenu(event, '${account.email_id}')">
                     <div class="account-info">
                         <div class="account-avatar">${account.email_id.charAt(0).toUpperCase()}</div>
                         <div class="account-details">
@@ -393,9 +531,17 @@ async function loadAccounts(page = 1, resetSearch = false) {
                         </div>
                     </div>
                     <div class="account-actions" onclick="event.stopPropagation()">
-                        <button class="btn btn-primary btn-sm" onclick="viewAccountEmails('${account.email_id}')">
+                        <button class="btn btn-primary btn-sm" onclick="openAccountEmailsInChildWindow('${account.email_id}', event)">
                             <span>📧</span>
                             查看邮件
+                        </button>
+                        <button class="${pinBtnClass}" onclick="toggleAccountPinned('${account.email_id}', event)">
+                            <span>${pinBtnIcon}</span>
+                            ${pinBtnLabel}
+                        </button>
+                        <button class="btn btn-secondary btn-sm" onclick="openAccountInfoModal('${account.email_id}', event)">
+                            <span>🛠️</span>
+                            账户信息
                         </button>
                         <button class="btn btn-secondary btn-sm" onclick="editAccountTags('${account.email_id}', ${JSON.stringify(account.tags || [])})">
                             <span>🏷️</span>
@@ -830,6 +976,17 @@ function showAccountContextMenu(event, emailId) {
     
     contextMenuTarget = emailId;
     const contextMenu = document.getElementById('contextMenu');
+    const pinMenuText = document.getElementById('contextPinMenuText');
+    const pinMenuIcon = document.getElementById('contextPinMenuIcon');
+    const isPinned = openedEmailAccounts.includes(emailId);
+
+    if (pinMenuText) {
+        pinMenuText.textContent = isPinned ? '取消挂载' : '挂到左侧';
+    }
+
+    if (pinMenuIcon) {
+        pinMenuIcon.textContent = isPinned ? '📍' : '📌';
+    }
     
     // 设置菜单位置
     contextMenu.style.left = event.pageX + 'px';
@@ -850,11 +1007,10 @@ function hideContextMenu() {
     document.removeEventListener('click', hideContextMenu);
 }
 
-// 在新标签页中打开
-function openInNewTab() {
+// 在子窗口中打开
+function openInChildWindow() {
     if (contextMenuTarget) {
-        const url = `${window.location.origin}/#/emails/${encodeURIComponent(contextMenuTarget)}`;
-        window.open(url, '_blank');
+        openAccountEmailsInChildWindow(contextMenuTarget);
     }
     hideContextMenu();
 }
@@ -862,7 +1018,9 @@ function openInNewTab() {
 // 复制账户链接
 function copyAccountLink() {
     if (contextMenuTarget) {
-        const url = `${window.location.origin}/#/emails/${encodeURIComponent(contextMenuTarget)}`;
+        const url = typeof buildEmailPageUrl === 'function'
+            ? buildEmailPageUrl(contextMenuTarget)
+            : `${window.location.origin}/#/emails/${encodeURIComponent(contextMenuTarget)}`;
         
         if (navigator.clipboard) {
             navigator.clipboard.writeText(url).then(() => {
@@ -873,6 +1031,43 @@ function copyAccountLink() {
         } else {
             fallbackCopyText(url);
         }
+    }
+    hideContextMenu();
+}
+
+function toggleAccountPinned(emailId, event = null) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const normalized = String(emailId || '').trim();
+    if (!normalized) {
+        return;
+    }
+
+    const accountsPage = document.getElementById('accountsPage');
+    const isAccountsPageVisible = Boolean(accountsPage && !accountsPage.classList.contains('hidden'));
+
+    if (openedEmailAccounts.includes(normalized)) {
+        closeOpenedAccount(normalized);
+        if (isAccountsPageVisible) {
+            loadAccounts(accountsCurrentPage);
+        }
+    } else {
+        const result = pinAccountToSidebar(normalized);
+        if (result.ok) {
+            showNotification(`已挂到左侧: ${normalized}`, 'success');
+            if (isAccountsPageVisible) {
+                loadAccounts(accountsCurrentPage);
+            }
+        }
+    }
+}
+
+function contextPinAccount() {
+    if (contextMenuTarget) {
+        toggleAccountPinned(contextMenuTarget);
     }
     hideContextMenu();
 }
@@ -909,17 +1104,4 @@ function contextDeleteAccount() {
         deleteAccount(contextMenuTarget);
     }
     hideContextMenu();
-}
-
-// 邮件列表右键菜单
-function showEmailsContextMenu(event) {
-    if (!currentAccount) {
-        return;
-    }
-    
-    event.preventDefault();
-    event.stopPropagation();
-    
-    const url = `${window.location.origin}/#/emails/${encodeURIComponent(currentAccount)}`;
-    window.open(url, '_blank');
 }

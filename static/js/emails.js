@@ -1,19 +1,379 @@
 // 邮件管理
+function normalizeEmailId(emailId) {
+    return String(emailId || '').trim();
+}
+
+function escapeHtml(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function getEmailsSearchInput() {
+    return document.querySelector('#emailsPage #emailSearch');
+}
+
+function isEmailsPageVisible() {
+    const page = document.getElementById('emailsPage');
+    return Boolean(page && !page.classList.contains('hidden'));
+}
+
+function setEmailsNavVisibility() {
+    const emailsNav = document.getElementById('emailsNav');
+    if (!emailsNav) {
+        return;
+    }
+
+    emailsNav.style.display = openedEmailAccounts.length > 0 ? 'block' : 'none';
+}
+
+function syncEmailsHash() {
+    if (!currentAccount) {
+        return;
+    }
+
+    const targetHash = `#/emails/${encodeURIComponent(currentAccount)}`;
+    if (window.location.hash === targetHash) {
+        return;
+    }
+
+    if (window.history && typeof window.history.replaceState === 'function') {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${targetHash}`);
+    } else {
+        window.location.hash = targetHash;
+    }
+}
+
+function clearEmailsHash() {
+    if (!window.location.hash.startsWith('#/emails/')) {
+        return;
+    }
+
+    if (window.history && typeof window.history.replaceState === 'function') {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    } else {
+        window.location.hash = '';
+    }
+}
+
+function buildEmailPageUrl(emailId) {
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return '';
+    }
+    const appPath = window.location.pathname || '/';
+    return `${window.location.origin}${appPath}#/emails/${encodeURIComponent(normalized)}`;
+}
+
+function buildEmailEmbedUrl(emailId, cacheKey = '') {
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return '';
+    }
+
+    const appPath = window.location.pathname || '/';
+    const params = new URLSearchParams(window.location.search);
+    params.set('embed', '1');
+
+    if (cacheKey) {
+        params.set('_cw', String(cacheKey));
+    } else {
+        params.delete('_cw');
+    }
+
+    const queryString = params.toString();
+    const hash = `#/emails/${encodeURIComponent(normalized)}`;
+    return `${appPath}${queryString ? `?${queryString}` : ''}${hash}`;
+}
+
+function getEmailChildWindowElements() {
+    return {
+        modal: document.getElementById('emailChildWindowModal'),
+        frame: document.getElementById('emailChildWindowFrame'),
+        title: document.getElementById('emailChildWindowTitle')
+    };
+}
+
+function openAccountEmailsInChildWindow(emailId, event = null) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return;
+    }
+
+    const targetUrl = buildEmailEmbedUrl(normalized);
+    if (!targetUrl) {
+        return;
+    }
+
+    const { modal, frame, title } = getEmailChildWindowElements();
+    if (!modal || !frame || !title) {
+        showWarning('未找到子窗口组件，已在当前页面打开');
+        viewAccountEmails(normalized);
+        return;
+    }
+
+    emailChildWindowAccount = normalized;
+    title.textContent = `邮箱：${normalized}`;
+
+    if (frame.dataset.account !== normalized || frame.getAttribute('src') !== targetUrl) {
+        frame.setAttribute('src', targetUrl);
+        frame.dataset.account = normalized;
+    }
+
+    modal.classList.remove('hidden');
+    document.body.classList.add('child-window-open');
+}
+
+function closeEmailChildWindow(event = null) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const { modal, frame } = getEmailChildWindowElements();
+    if (!modal || !frame) {
+        return;
+    }
+
+    modal.classList.add('hidden');
+    document.body.classList.remove('child-window-open');
+    emailChildWindowAccount = null;
+    frame.dataset.account = '';
+    frame.setAttribute('src', 'about:blank');
+}
+
+function updateCurrentAccountHeader() {
+    const emailElement = document.getElementById('currentAccountEmail');
+    const lastUpdateElement = document.getElementById('lastUpdateTime');
+    const copyIcon = document.querySelector('#emailsPage .copy-icon');
+
+    if (emailElement) {
+        emailElement.textContent = currentAccount || '';
+    }
+
+    if (lastUpdateElement) {
+        lastUpdateElement.textContent = currentAccount
+            ? (accountLastUpdateMap[currentAccount] || '-')
+            : '-';
+    }
+
+    if (copyIcon) {
+        copyIcon.style.display = currentAccount ? 'inline-block' : 'none';
+    }
+}
+
+function renderNoAccountState(message = '请从“邮箱账户”中打开一个账户查看邮件') {
+    const emailsList = document.getElementById('emailsList');
+    if (emailsList) {
+        emailsList.innerHTML = `<div class="text-center" style="padding: 40px; color: #64748b;">${escapeHtml(message)}</div>`;
+    }
+
+    filteredEmails = [];
+    allEmails = [];
+    updateEmailStats([]);
+
+    const pagination = document.getElementById('emailsPagination');
+    if (pagination) {
+        pagination.classList.add('hidden');
+    }
+}
+
+function ensureOpenedAccount(emailId) {
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return null;
+    }
+
+    if (!openedEmailAccounts.includes(normalized)) {
+        openedEmailAccounts.push(normalized);
+    }
+
+    return normalized;
+}
+
+function pinAccountToSidebar(emailId, event = null) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return { ok: false, existed: false };
+    }
+
+    const existed = openedEmailAccounts.includes(normalized);
+    ensureOpenedAccount(normalized);
+
+    if (!currentAccount) {
+        currentAccount = normalized;
+        updateCurrentAccountHeader();
+    }
+
+    setEmailsNavVisibility();
+    renderOpenedAccounts();
+    return { ok: true, existed };
+}
+
+function renderOpenedAccounts() {
+    const panel = document.getElementById('openedAccountsPanel');
+    const list = document.getElementById('openedAccountsList');
+    const count = document.getElementById('openedAccountsCount');
+
+    if (!panel || !list) {
+        return;
+    }
+
+    if (count) {
+        count.textContent = String(openedEmailAccounts.length);
+    }
+
+    if (openedEmailAccounts.length === 0) {
+        panel.classList.add('hidden');
+        list.innerHTML = '';
+        return;
+    }
+
+    panel.classList.remove('hidden');
+
+    list.innerHTML = openedEmailAccounts.map(emailId => {
+        const safeEmail = escapeHtml(emailId);
+        const encodedEmail = encodeURIComponent(emailId);
+        const avatar = escapeHtml(emailId.charAt(0).toUpperCase() || '?');
+        const isActive = emailId === currentAccount;
+
+        return `
+            <div class="opened-account-item ${isActive ? 'active' : ''}" onclick="activateOpenedAccount(decodeURIComponent('${encodedEmail}'))" title="${safeEmail}">
+                <span class="opened-account-dot">${avatar}</span>
+                <span class="opened-account-email">${safeEmail}</span>
+                <button type="button" class="opened-account-close" onclick="closeOpenedAccount(decodeURIComponent('${encodedEmail}'), event)" title="关闭 ${safeEmail}">×</button>
+            </div>
+        `;
+    }).join('');
+}
+
 function viewAccountEmails(emailId) {
-    currentAccount = emailId;
-    document.getElementById('currentAccountEmail').textContent = emailId;
-    document.getElementById('emailsNav').style.display = 'block';
+    const normalized = ensureOpenedAccount(emailId);
+    if (!normalized) {
+        return;
+    }
+
+    currentAccount = normalized;
+    updateCurrentAccountHeader();
+    setEmailsNavVisibility();
+    renderOpenedAccounts();
 
     // 重置过滤器
     clearFilters();
 
     showPage('emails');
+    syncEmailsHash();
+}
+
+function activateOpenedAccount(emailId) {
+    const normalized = ensureOpenedAccount(emailId);
+    if (!normalized) {
+        return;
+    }
+
+    currentAccount = normalized;
+    updateCurrentAccountHeader();
+    setEmailsNavVisibility();
+    renderOpenedAccounts();
+
+    clearFilters();
+
+    if (isEmailsPageVisible()) {
+        loadEmails();
+    } else {
+        showPage('emails');
+    }
+
+    syncEmailsHash();
+}
+
+function closeOpenedAccount(emailId, event = null) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    const normalized = normalizeEmailId(emailId);
+    if (!normalized) {
+        return;
+    }
+
+    const index = openedEmailAccounts.indexOf(normalized);
+    if (index === -1) {
+        return;
+    }
+
+    openedEmailAccounts.splice(index, 1);
+    delete accountLastUpdateMap[normalized];
+
+    const wasActive = currentAccount === normalized;
+
+    if (!wasActive) {
+        setEmailsNavVisibility();
+        renderOpenedAccounts();
+        showNotification(`已从快捷栏移除: ${normalized}`, 'info');
+        return;
+    }
+
+    if (openedEmailAccounts.length > 0) {
+        const fallbackIndex = Math.min(index, openedEmailAccounts.length - 1);
+        currentAccount = openedEmailAccounts[fallbackIndex];
+        updateCurrentAccountHeader();
+        setEmailsNavVisibility();
+        renderOpenedAccounts();
+
+        clearFilters();
+        if (isEmailsPageVisible()) {
+            loadEmails();
+        }
+        syncEmailsHash();
+    } else {
+        currentAccount = null;
+        updateCurrentAccountHeader();
+        setEmailsNavVisibility();
+        renderOpenedAccounts();
+        renderNoAccountState();
+        clearEmailsHash();
+
+        if (isEmailsPageVisible()) {
+            showPage('accounts');
+        }
+    }
+
+    showNotification(`已从快捷栏移除: ${normalized}`, 'info');
 }
 
 function backToAccounts() {
-    currentAccount = null;
-    document.getElementById('emailsNav').style.display = 'none';
+    if (isEmbedMode) {
+        try {
+            window.parent.postMessage(
+                {
+                    type: 'outlook-email-child-window-close',
+                    account: currentAccount || null
+                },
+                window.location.origin
+            );
+        } catch (_) {
+            // Ignore postMessage errors in embed mode
+        }
+        return;
+    }
+
     showPage('accounts');
+    clearEmailsHash();
 }
 
 function switchEmailTab(folder, targetElement = null) {
@@ -38,10 +398,19 @@ function switchEmailTab(folder, targetElement = null) {
 }
 
 async function loadEmails(forceRefresh = false) {
-    if (!currentAccount) return;
+    if (!currentAccount) {
+        renderNoAccountState();
+        return;
+    }
 
     const emailsList = document.getElementById('emailsList');
     const refreshBtn = document.getElementById('refreshBtn');
+
+    if (!emailsList || !refreshBtn) {
+        return;
+    }
+
+    const accountInRequest = currentAccount;
 
     // 显示加载状态
     emailsList.innerHTML = '<div class="loading"><div class="loading-spinner"></div>正在加载邮件...</div>';
@@ -50,8 +419,13 @@ async function loadEmails(forceRefresh = false) {
 
     try {
         const refreshParam = forceRefresh ? '&refresh=true' : '';
-        const url = `/emails/${currentAccount}?folder=${currentEmailFolder}&page=${currentEmailPage}&page_size=100${refreshParam}`;
+        const url = `/emails/${encodeURIComponent(accountInRequest)}?folder=${currentEmailFolder}&page=${currentEmailPage}&page_size=100${refreshParam}`;
         const data = await apiRequest(url);
+
+        // 已切换账户时丢弃过时响应
+        if (accountInRequest !== currentAccount) {
+            return;
+        }
 
         // 存储所有邮件数据
         allEmails = data.emails || [];
@@ -63,15 +437,18 @@ async function loadEmails(forceRefresh = false) {
         applyFilters();
 
         // 更新最后更新时间
-        document.getElementById('lastUpdateTime').textContent = new Date().toLocaleString();
+        accountLastUpdateMap[currentAccount] = new Date().toLocaleString();
+        updateCurrentAccountHeader();
 
         if (forceRefresh) {
             showNotification('邮件列表已刷新', 'success');
         }
 
     } catch (error) {
-        emailsList.innerHTML = '<div class="error">❌ 加载失败: ' + error.message + '</div>';
-        showNotification('加载邮件失败: ' + error.message, 'error');
+        if (accountInRequest === currentAccount) {
+            emailsList.innerHTML = '<div class="error">❌ 加载失败: ' + error.message + '</div>';
+            showNotification('加载邮件失败: ' + error.message, 'error');
+        }
     } finally {
         // 恢复刷新按钮状态
         refreshBtn.disabled = false;
@@ -104,7 +481,8 @@ function searchEmails() {
 }
 
 function applyFilters() {
-    const searchTerm = document.getElementById('emailSearch').value.toLowerCase();
+    const searchInput = getEmailsSearchInput();
+    const searchTerm = searchInput ? searchInput.value.toLowerCase() : '';
     const folderFilter = document.getElementById('folderFilter').value;
     const statusFilter = document.getElementById('statusFilter').value;
     const timeFilter = document.getElementById('timeFilter').value;
@@ -161,6 +539,10 @@ function applyFilters() {
 function renderFilteredEmails() {
     const emailsList = document.getElementById('emailsList');
 
+    if (!emailsList) {
+        return;
+    }
+
     if (filteredEmails.length === 0) {
         emailsList.innerHTML = '<div class="text-center" style="padding: 40px; color: #64748b;">没有找到匹配的邮件</div>';
         return;
@@ -170,7 +552,11 @@ function renderFilteredEmails() {
 }
 
 function clearFilters() {
-    document.getElementById('emailSearch').value = '';
+    const searchInput = getEmailsSearchInput();
+    if (searchInput) {
+        searchInput.value = '';
+    }
+
     document.getElementById('folderFilter').value = 'all';
     document.getElementById('statusFilter').value = 'all';
     document.getElementById('timeFilter').value = 'all';
@@ -201,12 +587,17 @@ function createEmailItem(email) {
 }
 
 async function showEmailDetail(messageId) {
+    if (!currentAccount) {
+        showNotification('请先选择一个邮箱账户', 'warning');
+        return;
+    }
+
     document.getElementById('emailModal').classList.remove('hidden');
     document.getElementById('emailModalTitle').textContent = '邮件详情';
     document.getElementById('emailModalContent').innerHTML = '<div class="loading">正在加载邮件详情...</div>';
 
     try {
-        const data = await apiRequest(`/emails/${currentAccount}/${messageId}`);
+        const data = await apiRequest(`/emails/${encodeURIComponent(currentAccount)}/${messageId}`);
 
         document.getElementById('emailModalTitle').textContent = data.subject || '(无主题)';
         document.getElementById('emailModalContent').innerHTML = `
@@ -291,7 +682,7 @@ async function clearCache() {
     if (!currentAccount) return;
 
     try {
-        await apiRequest(`/cache/${currentAccount}`, { method: 'DELETE' });
+        await apiRequest(`/cache/${encodeURIComponent(currentAccount)}`, { method: 'DELETE' });
         showNotification('缓存已清除', 'success');
         loadEmails(true);
     } catch (error) {
@@ -305,8 +696,9 @@ function exportEmails() {
         return;
     }
 
+    const exportAccount = currentAccount || 'unknown';
     const csvContent = generateEmailCSV(filteredEmails);
-    downloadCSV(csvContent, `emails_${currentAccount}_${new Date().toISOString().split('T')[0]}.csv`);
+    downloadCSV(csvContent, `emails_${exportAccount}_${new Date().toISOString().split('T')[0]}.csv`);
     showNotification(`已导出 ${filteredEmails.length} 封邮件`, 'success');
 }
 

@@ -11,10 +11,15 @@ function handleUrlRouting() {
         return;
     }
 
-    currentAccount = emailId;
-    document.getElementById('currentAccountEmail').textContent = emailId;
-    document.getElementById('emailsNav').style.display = 'block';
-    showPage('emails');
+    viewAccountEmails(emailId);
+}
+
+function initEmbedMode() {
+    if (!isEmbedMode) {
+        return;
+    }
+
+    document.body.classList.add('embed-mode');
 }
 
 // Event bindings
@@ -23,6 +28,26 @@ if (emailModal) {
     emailModal.addEventListener('click', function (event) {
         if (event.target === this) {
             closeEmailModal();
+        }
+    });
+}
+
+const emailChildWindowModal = document.getElementById('emailChildWindowModal');
+if (emailChildWindowModal) {
+    emailChildWindowModal.addEventListener('click', function (event) {
+        if (event.target === this || event.target.dataset.closeChildWindow === 'true') {
+            if (typeof closeEmailChildWindow === 'function') {
+                closeEmailChildWindow();
+            }
+        }
+    });
+}
+
+const accountInfoModal = document.getElementById('accountInfoModal');
+if (accountInfoModal) {
+    accountInfoModal.addEventListener('click', function (event) {
+        if (event.target === this && typeof closeAccountInfoModal === 'function') {
+            closeAccountInfoModal();
         }
     });
 }
@@ -37,13 +62,19 @@ if (changePasswordModal) {
 }
 
 document.addEventListener('keydown', function (event) {
-    if ((event.ctrlKey || event.metaKey) && event.key === 'r' && currentAccount) {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'r' && currentAccount && isEmailsPageVisible()) {
         event.preventDefault();
         refreshEmails();
     }
 
     if (event.key === 'Escape') {
         closeEmailModal();
+        if (typeof closeEmailChildWindow === 'function') {
+            closeEmailChildWindow();
+        }
+        if (typeof closeAccountInfoModal === 'function') {
+            closeAccountInfoModal();
+        }
         if (typeof closeChangePasswordModal === 'function') {
             closeChangePasswordModal();
         }
@@ -57,7 +88,7 @@ document.addEventListener('keydown', function (event) {
 });
 
 document.addEventListener('visibilitychange', function () {
-    if (document.hidden || !currentAccount) {
+    if (document.hidden || !currentAccount || !isEmailsPageVisible()) {
         return;
     }
 
@@ -80,8 +111,43 @@ window.addEventListener('popstate', function () {
     handleUrlRouting();
 });
 
+window.addEventListener('message', function (event) {
+    if (event.origin !== window.location.origin) {
+        return;
+    }
+
+    const data = event.data;
+    if (!data || typeof data !== 'object') {
+        return;
+    }
+
+    if (data.type === 'outlook-email-child-window-close' && typeof closeEmailChildWindow === 'function') {
+        closeEmailChildWindow();
+    }
+});
+
 window.addEventListener('load', function () {
+    initEmbedMode();
+
+    if (typeof setEmailsNavVisibility === 'function') {
+        setEmailsNavVisibility();
+    }
+
+    if (typeof renderOpenedAccounts === 'function') {
+        renderOpenedAccounts();
+    }
+
     handleUrlRouting();
+
+    if (isEmbedMode) {
+        if (!window.location.hash.startsWith('#/emails/')) {
+            showPage('emails');
+            if (typeof renderNoAccountState === 'function') {
+                renderNoAccountState('未指定邮箱账户，请从主页面选择账户后打开子窗口');
+            }
+        }
+        return;
+    }
 
     if (!window.location.hash || window.location.hash === '#') {
         showPage('accounts');

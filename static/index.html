@@ -34,11 +34,14 @@
                     <span class="icon">📖</span>
                     API管理
                 </button>
-                <button class="nav-item" onclick="showPage('emails', this)" oncontextmenu="showEmailsContextMenu(event)" id="emailsNav" style="display: none;">
-                    <span class="icon">📧</span>
-                    邮件列表
-                </button>
             </nav>
+            <div id="openedAccountsPanel" class="opened-accounts-panel hidden">
+                <div class="opened-accounts-header">
+                    <span class="opened-accounts-title">快捷邮箱</span>
+                    <span id="openedAccountsCount" class="opened-accounts-count">0</span>
+                </div>
+                <div id="openedAccountsList" class="opened-accounts-list"></div>
+            </div>
         </div>
 
         <!-- 主内容区域 -->
@@ -390,204 +393,10 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
                                 </div>
                             </div>
 
-                            <!-- 获取邮箱列表接口 -->
-                            <div class="api-endpoint">
-                                <div class="api-header">
-                                    <div style="display: flex; align-items: center;">
-                                        <span class="api-method get">GET</span>
-                                        <span class="api-path">/accounts</span>
-                                    </div>
-                                    <button class="api-try-button" onclick="tryApi('accounts')">🚀 试用接口</button>
-                                </div>
-                                <div class="api-body">
-                                    <p class="api-description">获取系统中所有已添加的邮箱账户列表，支持分页和模糊搜索。</p>
-
-                                    <div class="api-section">
-                                        <h4>请求参数</h4>
-                                        <div class="api-params">
-                                            <div class="api-param">
-                                                <span class="api-param-name">page</span>
-                                                <span class="api-param-type">integer</span>
-                                                <span class="api-param-desc">页码，从1开始，默认: 1</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">page_size</span>
-                                                <span class="api-param-type">integer</span>
-                                                <span class="api-param-desc">每页数量，范围1-100，默认: 10</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">email_search</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">邮箱账号模糊搜索，可选</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">tag_search</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">标签模糊搜索，可选</span>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>响应示例</h4>
-                                        <div class="api-example">{
-  "total_accounts": 25,
-  "page": 1,
-  "page_size": 10,
-  "total_pages": 3,
-  "accounts": [
-    {
-      "email_id": "example@outlook.com",
-      "client_id": "your-client-id",
-      "auth_mode": "imap",
-      "status": "active",
-      "tags": ["工作", "个人"]
-    }
-  ]
-}</div>
-                                    </div>
-
-                                    <div class="api-response" id="accountsResponse">
-                                        <h4 style="margin-bottom: 8px; color: #15803d;">响应结果：</h4>
-                                        <pre id="accountsResponseData"></pre>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- 获取邮件列表接口 -->
-                            <div class="api-endpoint">
-                                <div class="api-header">
-                                    <div style="display: flex; align-items: center;">
-                                        <span class="api-method get">GET</span>
-                                        <span class="api-path">/emails/{email_id}</span>
-                                    </div>
-                                    <button class="api-try-button" onclick="tryApi('emails')">🚀 试用接口</button>
-                                </div>
-                                <div class="api-body">
-                                    <p class="api-description">获取指定邮箱的邮件列表，支持分页和过滤。</p>
-
-                                    <div class="api-section">
-                                        <h4>路径参数</h4>
-                                        <div class="api-params">
-                                            <div class="api-param">
-                                                <span class="api-param-name">email_id</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">邮箱地址，需要URL编码</span>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>查询参数</h4>
-                                        <div class="api-params">
-                                            <div class="api-param">
-                                                <span class="api-param-name">folder</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">邮件文件夹 (all, inbox, junk)，默认: all</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">page</span>
-                                                <span class="api-param-type">integer</span>
-                                                <span class="api-param-desc">页码，从1开始，默认: 1</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">page_size</span>
-                                                <span class="api-param-type">integer</span>
-                                                <span class="api-param-desc">每页数量，范围1-500，默认: 100</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">refresh</span>
-                                                <span class="api-param-type">boolean</span>
-                                                <span class="api-param-desc">是否强制刷新缓存，默认: false</span>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>请求示例</h4>
-                                        <div class="api-example">GET /emails/example%40outlook.com?folder=inbox&page=1&page_size=20&refresh=true</div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>响应示例</h4>
-                                        <div class="api-example">{
-  "email_id": "example@outlook.com",
-  "folder_view": "inbox",
-  "page": 1,
-  "page_size": 20,
-  "total_emails": 150,
-  "emails": [
-    {
-      "message_id": "INBOX-1",
-      "folder": "INBOX",
-      "subject": "邮件主题",
-      "from_email": "sender@example.com",
-      "date": "2024-01-01T12:00:00Z",
-      "is_read": false,
-      "has_attachments": true,
-      "sender_initial": "S"
-    }
-  ]
-}</div>
-                                    </div>
-
-                                    <div class="api-response" id="emailsResponse">
-                                        <h4 style="margin-bottom: 8px; color: #15803d;">响应结果：</h4>
-                                        <pre id="emailsResponseData"></pre>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- 获取邮件详情接口 -->
-                            <div class="api-endpoint">
-                                <div class="api-header">
-                                    <div style="display: flex; align-items: center;">
-                                        <span class="api-method get">GET</span>
-                                        <span class="api-path">/emails/{email_id}/{message_id}</span>
-                                    </div>
-                                    <button class="api-try-button" onclick="tryApi('emailDetail')">🚀 试用接口</button>
-                                </div>
-                                <div class="api-body">
-                                    <p class="api-description">获取指定邮件的详细内容，包括邮件正文。</p>
-
-                                    <div class="api-section">
-                                        <h4>路径参数</h4>
-                                        <div class="api-params">
-                                            <div class="api-param">
-                                                <span class="api-param-name">email_id</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">邮箱地址，需要URL编码</span>
-                                            </div>
-                                            <div class="api-param">
-                                                <span class="api-param-name">message_id</span>
-                                                <span class="api-param-type">string</span>
-                                                <span class="api-param-desc">邮件ID，IMAP格式: {folder}-{id}，Graph格式: GRAPH-{encoded_id}</span>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>请求示例</h4>
-                                        <div class="api-example">GET /emails/example%40outlook.com/INBOX-1</div>
-                                    </div>
-
-                                    <div class="api-section">
-                                        <h4>响应示例</h4>
-                                        <div class="api-example">{
-  "message_id": "INBOX-1",
-  "subject": "邮件主题",
-  "from_email": "sender@example.com",
-  "to_email": "example@outlook.com",
-  "date": "2024-01-01T12:00:00Z",
-  "body_plain": "纯文本邮件内容",
-  "body_html": "&lt;html&gt;&lt;body&gt;HTML邮件内容&lt;/body&gt;&lt;/html&gt;"
-}</div>
-                                    </div>
-
-                                    <div class="api-response" id="emailDetailResponse">
-                                        <h4 style="margin-bottom: 8px; color: #15803d;">响应结果：</h4>
-                                        <pre id="emailDetailResponseData"></pre>
-                                    </div>
+                            <div id="openApiEndpoints">
+                                <div class="loading">
+                                    <div class="loading-spinner"></div>
+                                    正在加载OpenAPI文档...
                                 </div>
                             </div>
                         </div>
@@ -624,7 +433,7 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
                                     <span>📤</span>
                                     导出
                                 </button>
-                                <button class="btn btn-secondary btn-sm" onclick="backToAccounts()">
+                                <button class="btn btn-secondary btn-sm" id="backToAccountsBtn" onclick="backToAccounts()">
                                     <span>←</span>
                                     返回账户
                                 </button>
@@ -712,6 +521,26 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
         </div>
     </div>
 
+    <!-- 邮件子窗口（页面内） -->
+    <div id="emailChildWindowModal" class="email-child-window hidden" role="dialog" aria-modal="true" aria-label="邮件子窗口">
+        <div class="email-child-window-mask" data-close-child-window="true"></div>
+        <div class="email-child-window-panel">
+            <div class="email-child-window-header">
+                <div class="email-child-window-title-wrap">
+                    <span class="email-child-window-badge">子窗口</span>
+                    <h3 id="emailChildWindowTitle">邮件查看</h3>
+                </div>
+                <div class="email-child-window-actions">
+                    <button class="btn btn-secondary btn-sm" type="button" onclick="closeEmailChildWindow()">
+                        <span>✖</span>
+                        关闭
+                    </button>
+                </div>
+            </div>
+            <iframe id="emailChildWindowFrame" class="email-child-window-frame" src="about:blank" title="邮件子窗口内容"></iframe>
+        </div>
+    </div>
+
     <!-- 通知容器 -->
     <div id="notificationContainer" class="notification-container"></div>
 
@@ -726,6 +555,68 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
                 <div id="emailModalContent">
                     <div class="loading">正在加载邮件详情...</div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 账户信息模态框 -->
+    <div id="accountInfoModal" class="modal">
+        <div class="modal-content" style="max-width: 680px;">
+            <div class="modal-header">
+                <h3 id="accountInfoModalTitle">账户信息</h3>
+                <button class="modal-close" onclick="closeAccountInfoModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="account-info-grid">
+                    <div class="form-group">
+                        <label for="accountInfoEmail">邮箱地址</label>
+                        <input id="accountInfoEmail" class="form-control" type="text" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="accountInfoStatus">账户状态</label>
+                        <input id="accountInfoStatus" class="form-control" type="text" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="accountInfoAtExpires">AT过期时间</label>
+                        <input id="accountInfoAtExpires" class="form-control" type="text" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="accountInfoRtExpires">RT过期时间</label>
+                        <input id="accountInfoRtExpires" class="form-control" type="text" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label for="accountInfoAuthMode">认证模式</label>
+                        <select id="accountInfoAuthMode" class="form-control">
+                            <option value="auto">auto（自动识别）</option>
+                            <option value="imap">imap</option>
+                            <option value="graph">graph</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="accountInfoClientId">客户端ID (client_id)</label>
+                        <input id="accountInfoClientId" class="form-control" type="text" placeholder="请输入 client_id">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="accountInfoAccessToken">当前访问令牌 (access_token，只读缓存)</label>
+                    <textarea id="accountInfoAccessToken" class="form-control form-textarea" rows="3" readonly placeholder="未缓存AT（先取件或刷新RT）"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="accountInfoRefreshToken">刷新令牌 (refresh_token)</label>
+                    <textarea id="accountInfoRefreshToken" class="form-control form-textarea" rows="4" placeholder="请输入 refresh_token"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="accountInfoMailboxPassword">邮箱密码 (mailbox_password，可选)</label>
+                    <input id="accountInfoMailboxPassword" class="form-control" type="text" placeholder="用于 /web/邮箱----邮箱密码 快速取件">
+                </div>
+                <div class="form-group">
+                    <label for="accountInfoTags">标签（逗号分隔）</label>
+                    <input id="accountInfoTags" class="form-control" type="text" placeholder="工作,个人,重要">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeAccountInfoModal()">取消</button>
+                <button class="btn btn-primary" id="saveAccountInfoBtn" onclick="saveAccountInfo()">保存修改</button>
             </div>
         </div>
     </div>
@@ -759,13 +650,17 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
 
     <!-- 右键菜单 -->
     <div id="contextMenu" class="context-menu">
-        <div class="context-menu-item" onclick="openInNewTab()">
+        <div class="context-menu-item" onclick="openInChildWindow()">
             <span>🔗</span>
-            在新标签页中打开
+            在子窗口中打开
         </div>
         <div class="context-menu-item" onclick="copyAccountLink()">
             <span>📋</span>
             复制链接
+        </div>
+        <div id="contextPinMenuItem" class="context-menu-item" onclick="contextPinAccount()">
+            <span id="contextPinMenuIcon">📌</span>
+            <span id="contextPinMenuText">挂到左侧</span>
         </div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" onclick="contextEditTags()">

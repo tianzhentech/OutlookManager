@@ -36,7 +36,7 @@ from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from fastapi import FastAPI, HTTPException, Query, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from psycopg.rows import dict_row
@@ -99,6 +99,13 @@ SOCKET_TIMEOUT = 15
 
 # 缓存配置
 CACHE_EXPIRE_TIME = 60  # 缓存过期时间（秒）
+WEB_MAILBOX_SSE_POLL_SECONDS = int(os.getenv("WEB_MAILBOX_SSE_POLL_SECONDS", "5"))
+
+# 临时邮箱 API（GPTMail）配置
+TEMP_MAIL_API_BASE_URL = os.getenv("TEMP_MAIL_API_BASE_URL", "https://mail.chatgpt.org.uk").strip().rstrip("/")
+TEMP_MAIL_API_KEY = os.getenv("TEMP_MAIL_API_KEY", "gpt-test").strip()
+TEMP_MAIL_API_TIMEOUT_SECONDS = float(os.getenv("TEMP_MAIL_API_TIMEOUT_SECONDS", "12"))
+TEMP_MAIL_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # 日志配置
 logging.basicConfig(
@@ -229,6 +236,30 @@ class AccountListResponse(BaseModel):
     page_size: int
     total_pages: int
     accounts: List[AccountInfo]
+
+
+class AccountDetailResponse(BaseModel):
+    """账户详情响应模型（可编辑字段）"""
+    email_id: str
+    mailbox_password: Optional[str] = None
+    refresh_token: str
+    access_token: Optional[str] = None
+    client_id: str
+    auth_mode: str = "imap"
+    status: str = "active"
+    tags: List[str] = Field(default_factory=list)
+    access_token_expires_at: Optional[str] = None
+    refresh_token_expires_at: Optional[str] = None
+
+
+class AccountUpdateRequest(BaseModel):
+    """更新账户信息请求模型"""
+    mailbox_password: Optional[str] = None
+    refresh_token: str
+    client_id: str
+    auth_mode: str = Field(default="auto", pattern="^(auto|imap|graph)$")
+    tags: List[str] = Field(default_factory=list)
+
 
 class UpdateTagsRequest(BaseModel):
     """更新标签请求模型"""
@@ -757,6 +788,26 @@ def safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def resolve_account_status(
+    refresh_token: Optional[str],
+    client_id: Optional[str],
+    refresh_token_expires_at: Optional[int],
+    now_ts: Optional[int] = None
+) -> str:
+    """根据凭证完整性和RT过期时间计算账户状态。"""
+    token_value = str(refresh_token or "").strip()
+    client_value = str(client_id or "").strip()
+    current_ts = int(time.time()) if now_ts is None else int(now_ts)
+
+    if not token_value or not client_value:
+        return "invalid"
+
+    if refresh_token_expires_at is not None and refresh_token_expires_at <= current_ts:
+        return "expired"
+
+    return "active"
 
 
 def ensure_table_column(conn: PostgresConnection, table_name: str, column_name: str, column_sql: str) -> None:
@@ -1680,13 +1731,13 @@ async def get_all_accounts(
 
         paginated_accounts: List[AccountInfo] = []
         for row in rows:
-            status = "active"
-            if not row["refresh_token"] or not row["client_id"]:
-                status = "invalid"
-            else:
-                rt_expires_at = safe_int(row["refresh_token_expires_at"])
-                if rt_expires_at is not None and rt_expires_at <= now_ts:
-                    status = "expired"
+            rt_expires_at = safe_int(row["refresh_token_expires_at"])
+            status = resolve_account_status(
+                refresh_token=row["refresh_token"],
+                client_id=row["client_id"],
+                refresh_token_expires_at=rt_expires_at,
+                now_ts=now_ts
+            )
 
             paginated_accounts.append(
                 AccountInfo(
@@ -1696,7 +1747,7 @@ async def get_all_accounts(
                     status=status,
                     tags=parse_tags(row["tags"]),
                     access_token_expires_at=datetime_to_utc_iso(safe_int(row["access_token_expires_at"])),
-                    refresh_token_expires_at=datetime_to_utc_iso(safe_int(row["refresh_token_expires_at"]))
+                    refresh_token_expires_at=datetime_to_utc_iso(rt_expires_at)
                 )
             )
 
@@ -1711,6 +1762,103 @@ async def get_all_accounts(
     except Exception as e:
         logger.error(f"Error getting accounts list from PostgreSQL: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+async def get_account_detail(email_id: str) -> AccountDetailResponse:
+    """获取单个账户的完整可编辑信息。"""
+    normalized_email = normalize_email(email_id)
+    if not normalized_email:
+        raise HTTPException(status_code=400, detail="Invalid email_id")
+
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags,
+                       access_token_expires_at, refresh_token_expires_at
+                FROM accounts
+                WHERE email_id = ?
+                LIMIT 1
+                """,
+                (normalized_email,)
+            ).fetchone()
+    except Exception as e:
+        logger.error(f"Failed to get account detail from PostgreSQL for {normalized_email}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get account detail")
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Account {normalized_email} not found")
+
+    rt_expires_at = safe_int(row["refresh_token_expires_at"])
+    normalized_mode = normalize_auth_mode(row["auth_mode"], default="imap")
+    status = resolve_account_status(
+        refresh_token=row["refresh_token"],
+        client_id=row["client_id"],
+        refresh_token_expires_at=rt_expires_at
+    )
+    cached_access_token, _ = get_cached_access_token(normalized_email, normalized_mode)
+
+    return AccountDetailResponse(
+        email_id=row["email_id"],
+        mailbox_password=row["mailbox_password"] or None,
+        refresh_token=row["refresh_token"],
+        access_token=cached_access_token,
+        client_id=row["client_id"],
+        auth_mode=normalized_mode,
+        status=status,
+        tags=parse_tags(row["tags"]),
+        access_token_expires_at=datetime_to_utc_iso(safe_int(row["access_token_expires_at"])),
+        refresh_token_expires_at=datetime_to_utc_iso(rt_expires_at)
+    )
+
+
+async def update_account_detail(email_id: str, request: AccountUpdateRequest) -> AccountResponse:
+    """更新单个账户的可编辑信息。"""
+    normalized_email = normalize_email(email_id)
+    if not normalized_email:
+        raise HTTPException(status_code=400, detail="Invalid email_id")
+
+    # 先确认账户存在，避免误更新。
+    await get_account_credentials(normalized_email)
+
+    refresh_token = (request.refresh_token or "").strip()
+    client_id = (request.client_id or "").strip()
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token is required")
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    mailbox_password = (request.mailbox_password or "").strip() or None
+    tags = [str(tag).strip() for tag in (request.tags or []) if str(tag).strip()]
+    desired_mode = normalize_auth_mode(request.auth_mode, default="auto")
+
+    updated_credentials = AccountCredentials(
+        email=normalized_email,
+        mailbox_password=mailbox_password,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        auth_mode=desired_mode,
+        tags=tags
+    )
+
+    resolved_mode = await resolve_account_auth_mode(updated_credentials)
+    updated_credentials.auth_mode = resolved_mode
+    await save_account_credentials(normalized_email, updated_credentials)
+
+    # 尽快更新AT/RT时间，便于前台立即看到最新状态。
+    try:
+        await refresh_account_tokens_by_email(
+            email_id=normalized_email,
+            extend_refresh_expires_at=True,
+            preferred_mode=resolved_mode
+        )
+    except Exception as refresh_error:
+        logger.warning(f"Account token metadata refresh failed for {normalized_email}: {refresh_error}")
+
+    return AccountResponse(
+        email_id=normalized_email,
+        message=f"Account updated successfully. mode={resolved_mode}"
+    )
 
 
 # ============================================================================
@@ -2437,6 +2585,215 @@ async def get_email_details(credentials: AccountCredentials, message_id: str) ->
     return await get_email_details_imap(credentials, message_id)
 
 
+def parse_temp_mail_datetime(timestamp_value: Any, created_at_value: Any) -> str:
+    """将临时邮箱API时间字段标准化为ISO字符串。"""
+    if isinstance(timestamp_value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(timestamp_value), tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+
+    if isinstance(timestamp_value, str) and timestamp_value.strip():
+        try:
+            return datetime.fromtimestamp(float(timestamp_value.strip()), tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+
+    if isinstance(created_at_value, str) and created_at_value.strip():
+        raw_value = created_at_value.strip()
+        try:
+            return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).isoformat()
+        except Exception:
+            return raw_value
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_temp_mail_sort_timestamp(timestamp_value: Any, created_at_value: Any) -> float:
+    """提取临时邮箱邮件排序时间戳。"""
+    if isinstance(timestamp_value, (int, float)):
+        return float(timestamp_value)
+
+    if isinstance(timestamp_value, str) and timestamp_value.strip():
+        try:
+            return float(timestamp_value.strip())
+        except Exception:
+            pass
+
+    if isinstance(created_at_value, str) and created_at_value.strip():
+        try:
+            return datetime.fromisoformat(created_at_value.strip().replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def parse_temp_mail_api_error(payload: Any, fallback: str = "Unknown error") -> str:
+    """解析临时邮箱API返回错误信息。"""
+    if isinstance(payload, dict):
+        raw_error = payload.get("error")
+        if isinstance(raw_error, str) and raw_error.strip():
+            return raw_error.strip()
+    return fallback
+
+
+async def request_temp_mail_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """请求 GPTMail 临时邮箱 API。"""
+    if not TEMP_MAIL_API_BASE_URL:
+        raise HTTPException(status_code=500, detail="Temporary mailbox API base URL is not configured")
+
+    request_url = f"{TEMP_MAIL_API_BASE_URL}{path}"
+    headers = {"Accept": "application/json"}
+    if TEMP_MAIL_API_KEY:
+        headers["X-API-Key"] = TEMP_MAIL_API_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=TEMP_MAIL_API_TIMEOUT_SECONDS) as client:
+            response = await client.get(request_url, headers=headers, params=params)
+    except httpx.RequestError as e:
+        logger.error(f"Temporary mailbox API request error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to connect to temporary mailbox API")
+
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.error(f"Temporary mailbox API returned invalid JSON: {response.text[:500]}")
+        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid JSON")
+
+    if response.status_code >= 400:
+        error_detail = parse_temp_mail_api_error(payload, response.reason_phrase or "HTTP error")
+        mapped_status = response.status_code if response.status_code in {400, 401, 403, 404, 429} else 502
+        raise HTTPException(
+            status_code=mapped_status,
+            detail=f"Temporary mailbox API request failed: {error_detail}"
+        )
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid payload")
+
+    if payload.get("success") is False:
+        error_detail = parse_temp_mail_api_error(payload, "API returned success=false")
+        raise HTTPException(status_code=502, detail=f"Temporary mailbox API request failed: {error_detail}")
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid data field")
+
+    return data
+
+
+async def list_emails_temp_mail(
+    temp_email: str,
+    folder: str,
+    page: int,
+    page_size: int,
+    force_refresh: bool = False
+) -> EmailListResponse:
+    """从临时邮箱API获取邮件列表。"""
+    normalized_email = normalize_email(temp_email)
+    cache_key = get_cache_key(normalized_email, "temp-mail", folder, page, page_size)
+    cached_result = get_cached_emails(cache_key, force_refresh)
+    if cached_result:
+        return cached_result
+
+    if folder == "junk":
+        empty_result = EmailListResponse(
+            email_id=normalized_email,
+            folder_view=folder,
+            page=page,
+            page_size=page_size,
+            total_emails=0,
+            emails=[]
+        )
+        set_cached_emails(cache_key, empty_result)
+        return empty_result
+
+    data = await request_temp_mail_api("/api/emails", params={"email": normalized_email})
+    raw_emails = data.get("emails")
+    if not isinstance(raw_emails, list):
+        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid emails format")
+
+    sortable_items: List[Tuple[float, EmailItem]] = []
+    for raw_item in raw_emails:
+        if not isinstance(raw_item, dict):
+            continue
+
+        message_id = str(raw_item.get("id") or "").strip()
+        if not message_id:
+            continue
+
+        from_email = str(raw_item.get("from_address") or "")
+        sender_initial = "?"
+        sender_match = re.search(r"([a-zA-Z])", from_email)
+        if sender_match:
+            sender_initial = sender_match.group(1).upper()
+
+        timestamp_value = raw_item.get("timestamp")
+        created_at_value = raw_item.get("created_at")
+        normalized_date = parse_temp_mail_datetime(timestamp_value, created_at_value)
+        sort_ts = parse_temp_mail_sort_timestamp(timestamp_value, created_at_value)
+
+        sortable_items.append(
+            (
+                sort_ts,
+                EmailItem(
+                    message_id=message_id,
+                    folder="INBOX",
+                    subject=str(raw_item.get("subject") or "(No Subject)"),
+                    from_email=from_email,
+                    date=normalized_date,
+                    is_read=bool(raw_item.get("is_read", False)),
+                    has_attachments=bool(raw_item.get("has_attachments", False)),
+                    sender_initial=sender_initial
+                )
+            )
+        )
+
+    sortable_items.sort(key=lambda item: item[0], reverse=True)
+    all_items = [item for _, item in sortable_items]
+
+    start_index = (page - 1) * page_size
+    end_index = start_index + page_size
+    paged_items = all_items[start_index:end_index]
+
+    result = EmailListResponse(
+        email_id=normalized_email,
+        folder_view=folder,
+        page=page,
+        page_size=page_size,
+        total_emails=len(all_items),
+        emails=paged_items
+    )
+    set_cached_emails(cache_key, result)
+    return result
+
+
+async def get_email_details_temp_mail(message_id: str) -> EmailDetailsResponse:
+    """从临时邮箱API获取单封邮件详情。"""
+    normalized_message_id = str(message_id or "").strip()
+    if not normalized_message_id:
+        raise HTTPException(status_code=400, detail="Invalid temporary mailbox message_id")
+
+    data = await request_temp_mail_api(f"/api/email/{quote(normalized_message_id, safe='')}")
+
+    plain_content = data.get("content")
+    html_content = data.get("html_content")
+
+    body_plain = str(plain_content).strip() if plain_content is not None else ""
+    body_html = str(html_content).strip() if html_content is not None else ""
+
+    return EmailDetailsResponse(
+        message_id=str(data.get("id") or normalized_message_id),
+        subject=str(data.get("subject") or "(No Subject)"),
+        from_email=str(data.get("from_address") or "(Unknown Sender)"),
+        to_email=str(data.get("email_address") or "(Unknown Recipient)"),
+        date=parse_temp_mail_datetime(data.get("timestamp"), data.get("created_at")),
+        body_plain=body_plain or None,
+        body_html=body_html or None
+    )
+
+
 async def run_refresh_all_accounts_with_lock(extend_refresh_expires_at: bool = True) -> TokenRefreshAllResponse:
     global token_refresh_run_lock
     if token_refresh_run_lock is None:
@@ -2596,6 +2953,24 @@ async def get_accounts(
 ):
     """获取所有已加载的邮箱账户列表，支持分页和搜索"""
     return await get_all_accounts(page, page_size, email_search, tag_search)
+
+
+@app.get("/accounts/{email_id}", response_model=AccountDetailResponse)
+async def get_account(email_id: str):
+    """获取单个账户完整信息。"""
+    return await get_account_detail(email_id)
+
+
+@app.put("/accounts/{email_id}", response_model=AccountResponse)
+async def update_account(email_id: str, request: AccountUpdateRequest):
+    """更新单个账户信息。"""
+    try:
+        return await update_account_detail(email_id, request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating account {email_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update account")
 
 
 @app.get("/token-refresh/settings", response_model=TokenRefreshSettingsResponse)
@@ -2804,6 +3179,70 @@ async def get_web_account_credentials(credential_path: str) -> AccountCredential
     return credentials
 
 
+def parse_web_temp_email_path(credential_path: str) -> str:
+    """解析 /web/{temporary_email} 路径参数。"""
+    email_id = normalize_email(credential_path)
+    if not email_id or not TEMP_MAIL_EMAIL_PATTERN.match(email_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid web path format. Use /web/{email}----{mailbox_password} or /web/{temporary_email}"
+        )
+    return email_id
+
+
+async def resolve_web_mailbox_source(
+    credential_path: str
+) -> tuple[str, str, Optional[AccountCredentials], str]:
+    """
+    解析 /web 路径来源。
+
+    Returns:
+        source_type: outlook | temp
+        mailbox_email: 邮箱地址
+        credentials: Outlook凭证（仅outlook来源时有值）
+        normalized_path_for_links: 生成链接时使用的路径字符串
+    """
+    normalized_path = (credential_path or "").strip()
+    if not normalized_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid web path format. Credential path is required"
+        )
+
+    if "----" in normalized_path:
+        credentials = await get_web_account_credentials(normalized_path)
+        return "outlook", str(credentials.email), credentials, normalized_path
+
+    temp_email = parse_web_temp_email_path(normalized_path)
+    return "temp", temp_email, None, temp_email
+
+
+async def fetch_web_mailbox_email_response(
+    source_type: str,
+    mailbox_email: str,
+    credentials: Optional[AccountCredentials],
+    folder: str,
+    page: int,
+    page_size: int,
+    force_refresh: bool = False
+) -> EmailListResponse:
+    """按 /web 来源获取邮件列表。"""
+    if source_type == "temp":
+        return await list_emails_temp_mail(mailbox_email, folder, page, page_size, force_refresh)
+
+    if not credentials:
+        raise HTTPException(status_code=500, detail="Web mailbox credentials resolve failed")
+
+    return await list_emails(credentials, folder, page, page_size, force_refresh)
+
+
+def build_web_mailbox_signature(source_type: str, email_response: EmailListResponse) -> str:
+    """构建网页邮箱轮询签名，用于判断是否有新邮件。"""
+    top_message_ids = "|".join(item.message_id for item in email_response.emails[:5])
+    base = f"{source_type}|{email_response.folder_view}|{email_response.total_emails}|{top_message_ids}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
 @app.get("/web/{credential_path}", response_class=HTMLResponse)
 async def web_mailbox(
     credential_path: str,
@@ -2814,12 +3253,31 @@ async def web_mailbox(
 ):
     """
     Web快速查看邮箱。
-    访问路径示例：/web/user@outlook.com----mailbox_password
+    访问路径示例：
+    - /web/user@outlook.com----mailbox_password
+    - /web/temporary@mail.chatgpt.org.uk
     """
-    credentials = await get_web_account_credentials(credential_path)
-    email_response = await list_emails(credentials, folder, page, page_size, refresh)
+    source_type, mailbox_email, credentials, path_for_links = await resolve_web_mailbox_source(credential_path)
+    email_response = await fetch_web_mailbox_email_response(
+        source_type=source_type,
+        mailbox_email=mailbox_email,
+        credentials=credentials,
+        folder=folder,
+        page=page,
+        page_size=page_size,
+        force_refresh=refresh
+    )
+    source_chip = (
+        "来源：GPTMail 临时邮箱API"
+        if source_type == "temp"
+        else f"认证模式：{normalize_auth_mode(credentials.auth_mode if credentials else 'imap').upper()}"
+    )
 
-    encoded_credential = quote(credential_path, safe="")
+    encoded_credential = quote(path_for_links, safe="")
+    sse_url_js = json.dumps(
+        f"/web/{encoded_credential}/events?folder={folder}&page_size={page_size}",
+        ensure_ascii=False
+    )
     tab_links = [
         ("all", "全部"),
         ("inbox", "收件箱"),
@@ -2853,7 +3311,7 @@ async def web_mailbox(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{escape(credentials.email)} 邮件预览</title>
+  <title>{escape(mailbox_email)} 邮件预览</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
@@ -2862,8 +3320,12 @@ async def web_mailbox(
 <body class="webmail-page">
   <div class="wm-shell">
     <div class="wm-topbar">
-      <h2 class="wm-title">邮箱：{escape(credentials.email)}</h2>
-      <span class="wm-chip">认证模式：{escape(credentials.auth_mode.upper())}</span>
+      <h2 class="wm-title">邮箱：{escape(mailbox_email)}</h2>
+      <div class="wm-topbar-actions">
+        <button id="wmManualRefreshBtn" class="wm-pager-btn wm-refresh-btn" type="button">手动刷新</button>
+        <span id="wmRealtimeStatus" class="wm-chip">实时监听初始化中...</span>
+        <span class="wm-chip">{escape(source_chip)}</span>
+      </div>
     </div>
     <div class="wm-tabs">{tabs_html}</div>
     <div class="wm-table-wrap">
@@ -2886,18 +3348,198 @@ async def web_mailbox(
       <a class="wm-pager-btn" href="/web/{encoded_credential}?folder={folder}&page={next_page}&page_size={page_size}">下一页</a>
     </div>
   </div>
+  <script>
+    (() => {{
+      const sseUrl = {sse_url_js};
+      const manualRefreshBtn = document.getElementById("wmManualRefreshBtn");
+      const realtimeStatus = document.getElementById("wmRealtimeStatus");
+      let eventSource = null;
+      let hasPendingNewMail = false;
+
+      const buildRefreshUrl = () => {{
+        const url = new URL(window.location.href);
+        url.searchParams.set("refresh", "true");
+        return url.toString();
+      }};
+
+      const refreshNow = () => {{
+        window.location.replace(buildRefreshUrl());
+      }};
+
+      const setRealtimeStatus = (text) => {{
+        if (realtimeStatus) {{
+          realtimeStatus.textContent = text;
+        }}
+      }};
+
+      if (manualRefreshBtn) {{
+        manualRefreshBtn.addEventListener("click", refreshNow);
+      }}
+
+      if (typeof EventSource === "undefined") {{
+        setRealtimeStatus("当前浏览器不支持实时推送");
+        return;
+      }}
+
+      const closeRealtime = () => {{
+        if (eventSource) {{
+          eventSource.close();
+          eventSource = null;
+        }}
+      }};
+
+      setRealtimeStatus("实时监听中...");
+      eventSource = new EventSource(sseUrl);
+
+      eventSource.addEventListener("ready", (event) => {{
+        try {{
+          const payload = JSON.parse(event.data || "{{}}");
+          const total = Number(payload.total_emails || 0);
+          if (!hasPendingNewMail) {{
+            setRealtimeStatus(`实时监听中（当前 ${{total}} 封）`);
+          }}
+        }} catch (_) {{
+          if (!hasPendingNewMail) {{
+            setRealtimeStatus("实时监听中...");
+          }}
+        }}
+      }});
+
+      eventSource.addEventListener("new_mail", () => {{
+        hasPendingNewMail = true;
+        setRealtimeStatus("检测到新邮件，点击“手动刷新”查看");
+        if (manualRefreshBtn) {{
+          manualRefreshBtn.classList.add("wm-refresh-pulse");
+          manualRefreshBtn.textContent = "刷新查看新邮件";
+        }}
+      }});
+
+      eventSource.addEventListener("error", () => {{
+        if (!hasPendingNewMail) {{
+          setRealtimeStatus("连接中断，正在重连...");
+        }}
+      }});
+
+      window.addEventListener("beforeunload", closeRealtime);
+      window.addEventListener("pagehide", closeRealtime);
+    }})();
+  </script>
 </body>
 </html>
 """
     return HTMLResponse(content=html_content)
 
 
+@app.get("/web/{credential_path}/events")
+async def web_mailbox_events(
+    request: Request,
+    credential_path: str,
+    folder: str = Query("all", pattern="^(inbox|junk|all)$"),
+    page_size: int = Query(20, ge=1, le=100)
+):
+    """Web邮箱实时事件流：每5秒轮询一次，仅在发现新邮件时推送事件。"""
+    source_type, mailbox_email, credentials, _ = await resolve_web_mailbox_source(credential_path)
+    probe_page_size = max(1, min(20, page_size))
+    poll_interval_seconds = max(1, WEB_MAILBOX_SSE_POLL_SECONDS)
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        try:
+            initial_response = await fetch_web_mailbox_email_response(
+                source_type=source_type,
+                mailbox_email=mailbox_email,
+                credentials=credentials,
+                folder=folder,
+                page=1,
+                page_size=probe_page_size,
+                force_refresh=True
+            )
+        except HTTPException as e:
+            payload = json.dumps({"detail": str(e.detail)}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+        except Exception as e:
+            logger.error(f"Failed to initialize web mailbox SSE for {mailbox_email}: {e}")
+            payload = json.dumps({"detail": "Failed to initialize realtime mailbox stream"}, ensure_ascii=False)
+            yield f"event: error\ndata: {payload}\n\n"
+            return
+
+        previous_signature = build_web_mailbox_signature(source_type, initial_response)
+        ready_payload = {
+            "email_id": mailbox_email,
+            "total_emails": initial_response.total_emails,
+            "folder": folder
+        }
+        yield f"event: ready\ndata: {json.dumps(ready_payload, ensure_ascii=False)}\n\n"
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            await asyncio.sleep(poll_interval_seconds)
+
+            if await request.is_disconnected():
+                break
+
+            try:
+                latest_response = await fetch_web_mailbox_email_response(
+                    source_type=source_type,
+                    mailbox_email=mailbox_email,
+                    credentials=credentials,
+                    folder=folder,
+                    page=1,
+                    page_size=probe_page_size,
+                    force_refresh=True
+                )
+                latest_signature = build_web_mailbox_signature(source_type, latest_response)
+            except HTTPException as e:
+                payload = json.dumps({"detail": str(e.detail)}, ensure_ascii=False)
+                yield f"event: error\ndata: {payload}\n\n"
+                continue
+            except Exception as e:
+                logger.error(f"Web mailbox SSE polling failed for {mailbox_email}: {e}")
+                payload = json.dumps({"detail": "Realtime mailbox polling failed"}, ensure_ascii=False)
+                yield f"event: error\ndata: {payload}\n\n"
+                continue
+
+            if latest_signature != previous_signature:
+                latest_message_id = latest_response.emails[0].message_id if latest_response.emails else None
+                latest_date = latest_response.emails[0].date if latest_response.emails else None
+                payload = json.dumps(
+                    {
+                        "email_id": mailbox_email,
+                        "folder": folder,
+                        "total_emails": latest_response.total_emails,
+                        "latest_message_id": latest_message_id,
+                        "latest_date": latest_date
+                    },
+                    ensure_ascii=False
+                )
+                yield f"event: new_mail\ndata: {payload}\n\n"
+                previous_signature = latest_signature
+            else:
+                yield ": ping\n\n"
+
+        logger.info(f"Web mailbox SSE disconnected for {mailbox_email}")
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+
 @app.get("/web/{credential_path}/detail/{message_id:path}", response_class=HTMLResponse)
 async def web_mailbox_detail(credential_path: str, message_id: str):
     """Web快速查看邮件详情。"""
-    credentials = await get_web_account_credentials(credential_path)
-    detail = await get_email_details(credentials, message_id)
-    encoded_credential = quote(credential_path, safe="")
+    source_type, _, credentials, path_for_links = await resolve_web_mailbox_source(credential_path)
+    if source_type == "temp":
+        detail = await get_email_details_temp_mail(message_id)
+    else:
+        if not credentials:
+            raise HTTPException(status_code=500, detail="Web mailbox credentials resolve failed")
+        detail = await get_email_details(credentials, message_id)
+    encoded_credential = quote(path_for_links, safe="")
 
     body_section = ""
     if detail.body_html:
@@ -2958,6 +3600,7 @@ async def root():
     <div class="auth-chip"><span class="auth-dot"></span>Inbox Quick View</div>
     <h2>邮箱登录</h2>
     <p>输入邮箱和邮箱密码，登录后将跳转到邮件网页查看页。</p>
+    <p class="auth-tip">临时邮箱可直接访问：/web/{临时邮箱地址}</p>
     <form class="auth-form" id="webLoginForm">
       <label for="email">邮箱地址</label>
       <input id="email" type="email" required placeholder="example@outlook.com" />
@@ -3047,6 +3690,8 @@ async def api_status():
         "endpoints": {
             "get_accounts": "GET /accounts",
             "register_account": "POST /accounts",
+            "get_account": "GET /accounts/{email_id}",
+            "update_account": "PUT /accounts/{email_id}",
             "get_token_refresh_settings": "GET /token-refresh/settings",
             "update_token_refresh_settings": "PUT /token-refresh/settings",
             "refresh_all_tokens": "POST /token-refresh/refresh-all",

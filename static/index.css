@@ -117,6 +117,118 @@ body::after {
     padding: 16px 10px;
 }
 
+.opened-accounts-panel {
+    border-top: 1px solid rgba(184, 209, 229, 0.72);
+    background: linear-gradient(180deg, rgba(245, 251, 255, 0.92), rgba(236, 248, 255, 0.78));
+    padding: 12px 10px 14px;
+}
+
+.opened-accounts-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.opened-accounts-title {
+    color: #47627a;
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+}
+
+.opened-accounts-count {
+    min-width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 800;
+    background: linear-gradient(118deg, var(--brand), #10b7ff 60%, var(--brand-2));
+}
+
+.opened-accounts-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 240px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+.opened-account-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 12px;
+    border: 1px solid rgba(176, 203, 224, 0.82);
+    background: rgba(255, 255, 255, 0.88);
+    color: #47637b;
+    padding: 7px 8px 7px 9px;
+    cursor: pointer;
+    transition: transform 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+}
+
+.opened-account-item:hover {
+    border-color: #8ec2e8;
+    transform: translateY(-1px);
+    box-shadow: 0 8px 16px rgba(20, 64, 97, 0.14);
+}
+
+.opened-account-item.active {
+    border-color: transparent;
+    color: #fff;
+    background: linear-gradient(112deg, var(--brand), #10b8ff 58%, var(--brand-2));
+    box-shadow: 0 10px 18px rgba(15, 128, 255, 0.26);
+}
+
+.opened-account-dot {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--brand-3), #ff9a42 42%, var(--brand-2));
+    flex-shrink: 0;
+}
+
+.opened-account-email {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.opened-account-close {
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.86;
+    flex-shrink: 0;
+    transition: background 0.14s ease, opacity 0.14s ease;
+}
+
+.opened-account-close:hover {
+    opacity: 1;
+    background: rgba(255, 255, 255, 0.22);
+}
+
 .nav-item {
     display: flex;
     align-items: center;
@@ -731,6 +843,10 @@ label {
     display: none;
 }
 
+#accountInfoModal {
+    display: none;
+}
+
 .modal-content {
     width: min(92vw, 860px);
     max-height: 92vh;
@@ -781,6 +897,16 @@ label {
     padding: 18px 20px;
     overflow-y: auto;
     background: rgba(255, 255, 255, 0.72);
+}
+
+.account-info-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+}
+
+#accountInfoModal .form-group {
+    margin-bottom: 14px;
 }
 
 .email-detail-meta {
@@ -864,6 +990,96 @@ label {
     font-size: 0.87rem;
     color: #24445f;
     font-family: "Manrope", "Noto Sans SC", sans-serif;
+}
+
+body.child-window-open {
+    overflow: hidden;
+}
+
+.email-child-window {
+    position: fixed;
+    inset: 0;
+    z-index: 12000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+}
+
+.email-child-window-mask {
+    position: absolute;
+    inset: 0;
+    background: rgba(7, 29, 49, 0.45);
+    backdrop-filter: blur(3px);
+}
+
+.email-child-window-panel {
+    position: relative;
+    width: min(1600px, 96vw);
+    height: min(940px, 92vh);
+    border-radius: 18px;
+    border: 1px solid rgba(184, 209, 229, 0.88);
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 22px 54px rgba(8, 34, 56, 0.28);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.email-child-window-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid rgba(184, 209, 229, 0.74);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(237, 247, 255, 0.8));
+}
+
+.email-child-window-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.email-child-window-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    padding: 3px 9px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    color: #1e4a70;
+    background: #e4f2ff;
+    border: 1px solid #c5ddf2;
+    flex-shrink: 0;
+}
+
+.email-child-window-title-wrap h3 {
+    margin: 0;
+    color: #1c4364;
+    font-size: 0.94rem;
+    font-weight: 800;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.email-child-window-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.email-child-window-frame {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: #fff;
 }
 
 .context-menu {
@@ -1088,6 +1304,17 @@ label {
     color: #c63232;
 }
 
+.api-method.patch {
+    background: #efe8ff;
+    color: #6a38cc;
+}
+
+.api-method.options,
+.api-method.head {
+    background: #eceff3;
+    color: #516171;
+}
+
 .api-path,
 code,
 .api-example,
@@ -1303,6 +1530,50 @@ code {
     display: none !important;
 }
 
+body.embed-mode {
+    overflow: auto;
+    background: #f2f8fd;
+}
+
+body.embed-mode::before,
+body.embed-mode::after {
+    display: none;
+}
+
+body.embed-mode .app-container {
+    margin: 0;
+    height: auto;
+    min-height: 100vh;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    backdrop-filter: none;
+}
+
+body.embed-mode .sidebar,
+body.embed-mode .main-header,
+body.embed-mode .notification-container {
+    display: none;
+}
+
+body.embed-mode .main-content {
+    width: 100%;
+}
+
+body.embed-mode .main-body {
+    padding: 12px;
+    overflow: visible;
+}
+
+body.embed-mode .card {
+    margin-bottom: 0;
+}
+
+body.embed-mode #backToAccountsBtn {
+    display: none;
+}
+
 .text-center { text-align: center; }
 .text-sm { font-size: 0.86rem; }
 .text-xs { font-size: 0.78rem; }
@@ -1416,6 +1687,27 @@ code {
         padding: 9px 12px;
     }
 
+    .opened-accounts-panel {
+        border-top: none;
+        border-bottom: 1px solid rgba(184, 209, 229, 0.72);
+        padding: 10px;
+    }
+
+    .opened-accounts-list {
+        flex-direction: row;
+        gap: 8px;
+        max-height: none;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding-right: 0;
+        padding-bottom: 2px;
+    }
+
+    .opened-account-item {
+        min-width: 220px;
+        max-width: 280px;
+    }
+
     .main-body {
         padding: 14px;
     }
@@ -1433,6 +1725,24 @@ code {
         width: 100%;
         max-height: 95vh;
         border-radius: 14px;
+    }
+
+    .email-child-window {
+        padding: 8px;
+    }
+
+    .email-child-window-panel {
+        width: 100%;
+        height: calc(100vh - 16px);
+        border-radius: 12px;
+    }
+
+    .email-child-window-header {
+        flex-wrap: wrap;
+    }
+
+    .email-child-window-title-wrap {
+        width: 100%;
     }
 
     .account-item,
@@ -1512,6 +1822,10 @@ code {
         justify-content: flex-end;
     }
 
+    .account-info-grid {
+        grid-template-columns: 1fr;
+    }
+
     .token-refresh-toolbar {
         flex-direction: column;
         align-items: stretch;
@@ -1536,5 +1850,10 @@ code {
     .stat-item {
         flex: 1 1 calc(50% - 10px);
         min-width: 0;
+    }
+
+    .opened-account-item {
+        min-width: 188px;
+        max-width: 220px;
     }
 }
