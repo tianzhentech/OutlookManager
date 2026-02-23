@@ -298,7 +298,7 @@ body::after {
 
 .main-body {
     flex: 1;
-    padding: 22px;
+    padding: 12px 22px 22px;
     overflow-y: auto;
     overflow-x: hidden;
     background: transparent;
@@ -1709,7 +1709,7 @@ body.embed-mode #backToAccountsBtn {
     }
 
     .main-body {
-        padding: 14px;
+        padding: 10px 14px 14px;
     }
 
     .card {
@@ -1799,7 +1799,7 @@ body.embed-mode #backToAccountsBtn {
     }
 
     .main-body {
-        padding: 10px;
+        padding: 8px 10px 10px;
     }
 
     .btn,

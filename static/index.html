@@ -60,11 +60,7 @@
                 <!-- 邮箱账户列表页面 -->
                 <div id="accountsPage" class="page">
                     <div class="card">
-                        <div class="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 class="font-semibold">邮箱账户管理</h3>
-                                <p class="text-sm" style="color: #64748b;">管理所有已添加的邮箱账户</p>
-                            </div>
+                        <div class="flex justify-end mb-4">
                             <div class="flex gap-2">
                                 <button class="btn btn-primary btn-sm" onclick="showPage('addAccount')">
                                     <span>➕</span>
@@ -161,11 +157,7 @@
                 <!-- 添加单个账户页面 -->
                 <div id="addAccountPage" class="page hidden">
                     <div class="card">
-                        <div class="flex items-center justify-between mb-6">
-                            <div>
-                                <h3 class="font-semibold">添加邮箱账户</h3>
-                                <p class="text-sm" style="color: #64748b;">添加单个Outlook邮箱账户到系统</p>
-                            </div>
+                        <div class="flex justify-end mb-4">
                             <button class="btn btn-secondary btn-sm" onclick="showPage('accounts')">
                                 <span>←</span>
                                 返回列表
@@ -256,11 +248,7 @@
                 <!-- 批量添加账户页面 -->
                 <div id="batchAddPage" class="page hidden">
                     <div class="card">
-                        <div class="flex items-center justify-between mb-6">
-                            <div>
-                                <h3 class="font-semibold">批量添加邮箱账户</h3>
-                                <p class="text-sm" style="color: #64748b;">一次性添加多个邮箱账户到系统</p>
-                            </div>
+                        <div class="flex justify-end mb-4">
                             <button class="btn btn-secondary btn-sm" onclick="showPage('accounts')">
                                 <span>←</span>
                                 返回列表
@@ -352,11 +340,7 @@ example3@outlook.com----password3----refresh_token3----client_id3"></textarea>
                 <!-- API文档页面 -->
                 <div id="apiDocsPage" class="page hidden">
                     <div class="card">
-                        <div class="flex items-center justify-between mb-6">
-                            <div>
-                                <h3 class="font-semibold">API接口文档</h3>
-                                <p class="text-sm" style="color: #64748b;">邮件管理系统的RESTful API接口说明</p>
-                            </div>
+                        <div class="flex justify-end mb-4">
                             <div class="flex gap-2">
                                 <button class="btn btn-secondary btn-sm" onclick="copyApiBaseUrl()">
                                     <span>📋</span>
