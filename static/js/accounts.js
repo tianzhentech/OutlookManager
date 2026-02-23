@@ -12,6 +12,190 @@ function clearBatchForm() {
     document.getElementById('batchAuthMode').value = 'auto';
 }
 
+function formatTokenExpiry(dateTimeString) {
+    if (!dateTimeString) {
+        return '未获取';
+    }
+
+    const date = new Date(dateTimeString);
+    if (Number.isNaN(date.getTime())) {
+        return '时间无效';
+    }
+
+    return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatRefreshUnitLabel(unit) {
+    if (unit === 'day') return '天';
+    if (unit === 'hour') return '小时';
+    return '分钟';
+}
+
+function buildRefreshTokenButtonId(emailId) {
+    return `refresh-token-${String(emailId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
+function renderTokenRefreshSettings(settings) {
+    tokenRefreshSettings = settings || null;
+
+    const enabledInput = document.getElementById('tokenRefreshEnabled');
+    const intervalInput = document.getElementById('tokenRefreshInterval');
+    const unitSelect = document.getElementById('tokenRefreshUnit');
+    const scheduleInfo = document.getElementById('tokenRefreshScheduleInfo');
+
+    if (!enabledInput || !intervalInput || !unitSelect || !scheduleInfo) {
+        return;
+    }
+
+    if (!settings) {
+        enabledInput.checked = false;
+        intervalInput.value = 12;
+        unitSelect.value = 'hour';
+        scheduleInfo.textContent = '定时刷新未配置';
+        return;
+    }
+
+    enabledInput.checked = Boolean(settings.enabled);
+    intervalInput.value = settings.interval_value || 12;
+    unitSelect.value = settings.interval_unit || 'hour';
+
+    const nextRunText = settings.next_run_at ? formatTokenExpiry(settings.next_run_at) : '未计划';
+    const lastRunText = settings.last_run_at ? formatTokenExpiry(settings.last_run_at) : '暂无';
+    const intervalLabel = `${settings.interval_value}${formatRefreshUnitLabel(settings.interval_unit)}`;
+
+    if (settings.enabled) {
+        scheduleInfo.textContent = `已启用（每${intervalLabel}）| 下次: ${nextRunText} | 上次: ${lastRunText}`;
+    } else {
+        scheduleInfo.textContent = `已关闭 | 上次: ${lastRunText}`;
+    }
+}
+
+async function loadTokenRefreshSettings(silent = true) {
+    try {
+        const settings = await apiRequest('/token-refresh/settings');
+        renderTokenRefreshSettings(settings);
+        return settings;
+    } catch (error) {
+        if (!silent) {
+            showError('加载定时刷新设置失败: ' + error.message);
+        }
+        return null;
+    }
+}
+
+async function saveTokenRefreshSettings() {
+    const enabledInput = document.getElementById('tokenRefreshEnabled');
+    const intervalInput = document.getElementById('tokenRefreshInterval');
+    const unitSelect = document.getElementById('tokenRefreshUnit');
+    const saveBtn = document.getElementById('saveTokenRefreshSettingsBtn');
+
+    if (!enabledInput || !intervalInput || !unitSelect || !saveBtn) {
+        return;
+    }
+
+    const intervalValue = parseInt(intervalInput.value, 10);
+    if (!Number.isFinite(intervalValue) || intervalValue < 1) {
+        showWarning('刷新间隔必须是大于等于 1 的整数');
+        return;
+    }
+
+    saveBtn.disabled = true;
+    const previousText = saveBtn.innerHTML;
+    saveBtn.innerHTML = '<span>⏳</span> 保存中...';
+
+    try {
+        const updated = await apiRequest('/token-refresh/settings', {
+            method: 'PUT',
+            body: JSON.stringify({
+                enabled: Boolean(enabledInput.checked),
+                interval_value: intervalValue,
+                interval_unit: unitSelect.value
+            })
+        });
+
+        renderTokenRefreshSettings(updated);
+        showSuccess('定时刷新设置已保存');
+    } catch (error) {
+        showError('保存定时刷新设置失败: ' + error.message);
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = previousText;
+    }
+}
+
+async function refreshAllAccountTokens() {
+    if (isRefreshingAllTokens) {
+        return;
+    }
+
+    const refreshAllBtn = document.getElementById('refreshAllTokensBtn');
+    if (!refreshAllBtn) {
+        return;
+    }
+
+    isRefreshingAllTokens = true;
+    refreshAllBtn.disabled = true;
+    const previousText = refreshAllBtn.innerHTML;
+    refreshAllBtn.innerHTML = '<span>⏳</span> 刷新中...';
+
+    try {
+        const result = await apiRequest('/token-refresh/refresh-all', {
+            method: 'POST'
+        });
+
+        if ((result.failure_count || 0) > 0) {
+            showWarning(`全部刷新完成：成功 ${result.success_count}，失败 ${result.failure_count}`);
+        } else {
+            showSuccess(`全部刷新完成：成功 ${result.success_count}`);
+        }
+
+        await loadAccounts(accountsCurrentPage);
+    } catch (error) {
+        showError('全部刷新失败: ' + error.message);
+    } finally {
+        isRefreshingAllTokens = false;
+        refreshAllBtn.disabled = false;
+        refreshAllBtn.innerHTML = previousText;
+    }
+}
+
+async function refreshAccountToken(emailId, event = null) {
+    if (event) {
+        event.stopPropagation();
+    }
+
+    if (!emailId || refreshingTokenAccountIds.has(emailId)) {
+        return;
+    }
+
+    const refreshBtnId = buildRefreshTokenButtonId(emailId);
+    const refreshBtn = document.getElementById(refreshBtnId);
+
+    refreshingTokenAccountIds.add(emailId);
+    if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.dataset.originalText = refreshBtn.innerHTML;
+        refreshBtn.innerHTML = '<span>⏳</span> 刷新中...';
+    }
+
+    try {
+        await apiRequest(`/accounts/${encodeURIComponent(emailId)}/refresh-token`, {
+            method: 'POST'
+        });
+
+        showSuccess(`${emailId} 的RT已刷新`);
+        await loadAccounts(accountsCurrentPage);
+    } catch (error) {
+        showError(`刷新 ${emailId} 失败: ${error.message}`);
+    } finally {
+        refreshingTokenAccountIds.delete(emailId);
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.innerHTML = refreshBtn.dataset.originalText || '<span>🔁</span> 刷新RT';
+        }
+    }
+}
+
 function isGuid(value) {
     return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
 }
@@ -156,6 +340,8 @@ async function loadAccounts(page = 1, resetSearch = false) {
     accountsPagination.style.display = 'none';
 
     try {
+        await loadTokenRefreshSettings(true);
+
         // 构建请求参数
         const params = new URLSearchParams({
             page: accountsCurrentPage,
@@ -190,6 +376,10 @@ async function loadAccounts(page = 1, resetSearch = false) {
                 ? `<div class="account-tags">${account.tags.map(tag => 
                     `<span class="account-tag">${tag}</span>`).join('')}</div>` 
                 : '';
+
+            const atExpires = formatTokenExpiry(account.access_token_expires_at);
+            const rtExpires = formatTokenExpiry(account.refresh_token_expires_at);
+            const refreshBtnId = buildRefreshTokenButtonId(account.email_id);
                 
             return `
                 <div class="account-item" onclick="viewAccountEmails('${account.email_id}')" oncontextmenu="showAccountContextMenu(event, '${account.email_id}')">
@@ -198,6 +388,7 @@ async function loadAccounts(page = 1, resetSearch = false) {
                         <div class="account-details">
                             <h4>${account.email_id}</h4>
                             <p>状态: ${account.status === 'active' ? '正常' : '异常'} | 协议: ${(account.auth_mode || 'imap').toUpperCase()}</p>
+                            <p class="account-token-meta">AT过期: ${atExpires} | RT过期: ${rtExpires}</p>
                             ${tagsHtml}
                         </div>
                     </div>
@@ -209,6 +400,10 @@ async function loadAccounts(page = 1, resetSearch = false) {
                         <button class="btn btn-secondary btn-sm" onclick="editAccountTags('${account.email_id}', ${JSON.stringify(account.tags || [])})">
                             <span>🏷️</span>
                             管理标签
+                        </button>
+                        <button class="btn btn-secondary btn-sm" id="${refreshBtnId}" onclick="refreshAccountToken('${account.email_id}', event)">
+                            <span>🔁</span>
+                            刷新RT
                         </button>
                         <button class="btn btn-danger btn-sm" onclick="deleteAccount('${account.email_id}')">
                             <span>🗑️</span>

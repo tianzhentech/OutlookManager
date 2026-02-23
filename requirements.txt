@@ -3,3 +3,5 @@ httpx==0.25.2
 aioimaplib==2.0.1
 pydantic[email]>=2.10,<3
 requests==2.31.0 
+psycopg[binary]==3.2.3
+redis==5.2.1

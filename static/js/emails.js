@@ -214,7 +214,7 @@ async function showEmailDetail(messageId) {
                 <p><strong>发件人:</strong> ${data.from_email}</p>
                 <p><strong>收件人:</strong> ${data.to_email}</p>
                 <p><strong>日期:</strong> ${formatEmailDate(data.date)} (${new Date(data.date).toLocaleString()})</p>
-                <p><strong>邮件ID:</strong> ${data.message_id}</p>
+                <p class="email-id-line"><strong>邮件ID:</strong><span class="email-id-value">${data.message_id}</span></p>
             </div>
             ${renderEmailContent(data)}
         `;

@@ -1,24 +1,57 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: outlook-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-outlook_manager}
+      POSTGRES_USER: ${POSTGRES_USER:-outlook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-outlook}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-outlook} -d ${POSTGRES_DB:-outlook_manager}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - outlook-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: outlook-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - outlook-network
+
   outlook-email-client:
     build: .
     container_name: outlook-email-api
     ports:
       - "8000:8000"
-    volumes:
-      # 数据持久化 - 保存用户账户信息
-      - ./data:/app/data
-      # 可选：如果需要自定义配置文件
-      - ./accounts.json:/app/accounts.json
     environment:
-      # 可以通过环境变量覆盖默认配置
-      - PYTHONUNBUFFERED=1
-      - HOST=0.0.0.0
-      - PORT=8000
+      PYTHONUNBUFFERED: "1"
+      HOST: 0.0.0.0
+      PORT: 8000
+      DATABASE_URL: ${DATABASE_URL:-postgresql://outlook:outlook@postgres:5432/outlook_manager}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-outlook-manager}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api')"]
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -31,5 +64,7 @@ networks:
     driver: bridge
 
 volumes:
-  outlook-data:
-    driver: local 
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local

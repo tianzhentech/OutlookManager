@@ -424,6 +424,8 @@ label {
     display: flex;
     gap: 8px;
     flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 
 .account-tags,
@@ -547,6 +549,16 @@ label {
 
 .token-refresh-interval input {
     width: 110px;
+    min-height: 34px;
+    border-radius: 10px;
+    border: 1px solid rgba(169, 197, 218, 0.86);
+    background: rgba(255, 255, 255, 0.9);
+    padding: 6px 8px;
+    color: #1e3d58;
+}
+
+.token-refresh-interval .token-refresh-unit {
+    width: 104px;
     min-height: 34px;
     border-radius: 10px;
     border: 1px solid rgba(169, 197, 218, 0.86);
@@ -781,6 +793,23 @@ label {
     margin: 6px 0;
     color: #547086;
     font-size: 0.86rem;
+}
+
+.email-detail-meta .email-id-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    width: 100%;
+}
+
+.email-detail-meta .email-id-line strong {
+    flex: 0 0 auto;
+}
+
+.email-detail-meta .email-id-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 .email-content-tabs {
@@ -1444,6 +1473,10 @@ code {
     .token-refresh-interval input {
         width: 96px;
     }
+
+    .token-refresh-interval .token-refresh-unit {
+        width: 96px;
+    }
 }
 
 @media (max-width: 520px) {
@@ -1489,6 +1522,10 @@ code {
     }
 
     .token-refresh-interval input {
+        flex: 1;
+    }
+
+    .token-refresh-interval .token-refresh-unit {
         flex: 1;
     }
 

@@ -20,3 +20,7 @@ let filteredEmails = [];
 let searchTimeout = null;
 
 let contextMenuTarget = null;
+
+let tokenRefreshSettings = null;
+let isRefreshingAllTokens = false;
+let refreshingTokenAccountIds = new Set();

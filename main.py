@@ -17,28 +17,29 @@ import logging
 import os
 import re
 import socket
-import sqlite3
 import threading
 import time
 import hashlib
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from itertools import groupby
-from pathlib import Path
 from queue import Empty, Queue
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
+import psycopg
+import redis
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from fastapi import FastAPI, HTTPException, Query, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from psycopg.rows import dict_row
 
 
 
@@ -46,8 +47,11 @@ from pydantic import BaseModel, EmailStr, Field
 # 配置常量
 # ============================================================================
 
-# 文件路径配置
-ACCOUNTS_DB_FILE = Path(__file__).resolve().parent / "accounts.db"
+# 数据库和缓存配置
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://outlook:outlook@postgres:5432/outlook_manager").strip()
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0").strip()
+REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "outlook-manager").strip() or "outlook-manager"
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3"))
 
 # OAuth2配置
 TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
@@ -66,9 +70,23 @@ ADMIN_REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_REFRESH_TOKEN_TTL_SECONDS
 ADMIN_COOKIE_SECURE = os.getenv("ADMIN_COOKIE_SECURE", "false").strip().lower() == "true"
 ADMIN_ACCESS_COOKIE_NAME = "admin_access_token"
 ADMIN_REFRESH_COOKIE_NAME = "admin_refresh_token"
-ADMIN_PROTECTED_API_PREFIXES = ("/accounts", "/emails", "/cache")
+ADMIN_PROTECTED_API_PREFIXES = ("/accounts", "/emails", "/cache", "/token-refresh")
 ADMIN_PROTECTED_HTML_PATHS = {"/admin/panel", "/admin/panel/", "/static/index.html"}
 ADMIN_PROTECTED_EXACT_PATHS = {"/api", *ADMIN_PROTECTED_HTML_PATHS}
+
+# 账户令牌配置
+DEFAULT_ACCOUNT_RT_TTL_SECONDS = int(os.getenv("DEFAULT_ACCOUNT_RT_TTL_SECONDS", str(90 * 24 * 3600)))
+DEFAULT_ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("DEFAULT_ACCESS_TOKEN_TTL_SECONDS", "3600"))
+
+# 自动刷新RT配置
+TOKEN_REFRESH_DEFAULT_INTERVAL_VALUE = int(os.getenv("TOKEN_REFRESH_DEFAULT_INTERVAL_VALUE", "12"))
+TOKEN_REFRESH_DEFAULT_INTERVAL_UNIT = os.getenv("TOKEN_REFRESH_DEFAULT_INTERVAL_UNIT", "hour").strip().lower()
+TOKEN_REFRESH_SCHEDULER_CHECK_SECONDS = int(os.getenv("TOKEN_REFRESH_SCHEDULER_CHECK_SECONDS", "30"))
+TOKEN_REFRESH_SUPPORTED_UNITS = {"minute", "hour", "day"}
+
+# AT复用/刷新阈值配置
+ACCESS_TOKEN_BACKGROUND_REFRESH_SECONDS = int(os.getenv("ACCESS_TOKEN_BACKGROUND_REFRESH_SECONDS", "300"))
+ACCESS_TOKEN_FORCE_REFRESH_SECONDS = int(os.getenv("ACCESS_TOKEN_FORCE_REFRESH_SECONDS", "30"))
 
 # IMAP服务器配置
 IMAP_SERVER = "outlook.live.com"
@@ -90,6 +108,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# 自动刷新任务运行状态
+token_refresh_scheduler_task: Optional[asyncio.Task] = None
+token_refresh_scheduler_stop_event: Optional[asyncio.Event] = None
+token_refresh_run_lock: Optional[asyncio.Lock] = None
+
+# AT缓存与后台续期状态（进程内）
+access_token_cache: Dict[str, Dict[str, Any]] = {}
+access_token_refresh_locks: Dict[str, asyncio.Lock] = {}
+access_token_background_tasks: Dict[str, asyncio.Task] = {}
+
+# Redis客户端（用于邮件缓存和AT缓存）
+redis_client: Optional[redis.Redis] = None
+
+
 # ============================================================================
 # 数据模型 (Pydantic Models)
 # ============================================================================
@@ -101,10 +133,9 @@ class AccountCredentials(BaseModel):
     refresh_token: str
     client_id: str
     auth_mode: str = Field(default="auto")
-    tags: Optional[List[str]] = Field(default=[])
-
-    class Config:
-        schema_extra = {
+    tags: Optional[List[str]] = Field(default_factory=list)
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "email": "user@outlook.com",
                 "mailbox_password": "mailbox-password",
@@ -114,6 +145,7 @@ class AccountCredentials(BaseModel):
                 "tags": ["工作", "个人"]
             }
         }
+    )
 
 
 class EmailItem(BaseModel):
@@ -127,8 +159,8 @@ class EmailItem(BaseModel):
     has_attachments: bool = False
     sender_initial: str = "?"
 
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "message_id": "INBOX-123",
                 "folder": "INBOX",
@@ -140,6 +172,7 @@ class EmailItem(BaseModel):
                 "sender_initial": "A"
             }
         }
+    )
 
 
 class EmailListResponse(BaseModel):
@@ -184,7 +217,9 @@ class AccountInfo(BaseModel):
     client_id: str
     auth_mode: str = "imap"
     status: str = "active"
-    tags: List[str] = []
+    tags: List[str] = Field(default_factory=list)
+    access_token_expires_at: Optional[str] = None
+    refresh_token_expires_at: Optional[str] = None
 
 
 class AccountListResponse(BaseModel):
@@ -198,6 +233,40 @@ class AccountListResponse(BaseModel):
 class UpdateTagsRequest(BaseModel):
     """更新标签请求模型"""
     tags: List[str]
+
+
+class TokenRefreshSettingsUpdateRequest(BaseModel):
+    """更新定时刷新设置请求"""
+    enabled: bool
+    interval_value: int = Field(..., ge=1, le=100000)
+    interval_unit: str = Field(..., pattern="^(minute|hour|day)$")
+
+
+class TokenRefreshSettingsResponse(BaseModel):
+    """定时刷新设置响应"""
+    enabled: bool
+    interval_value: int
+    interval_unit: str
+    next_run_at: Optional[str] = None
+    last_run_at: Optional[str] = None
+
+
+class TokenRefreshAccountResponse(BaseModel):
+    """单账户令牌刷新响应"""
+    email_id: str
+    auth_mode: str
+    access_token_expires_at: Optional[str] = None
+    refresh_token_expires_at: Optional[str] = None
+    message: str
+
+
+class TokenRefreshAllResponse(BaseModel):
+    """全账户令牌刷新响应"""
+    total_accounts: int
+    success_count: int
+    failure_count: int
+    message: str
+    details: List[str] = Field(default_factory=list)
 
 # ============================================================================
 # IMAP连接池管理
@@ -379,6 +448,83 @@ email_cache = {}  # 邮件列表缓存
 email_count_cache = {}  # 邮件总数缓存，用于检测新邮件
 
 
+class PostgresConnection:
+    """简化版PostgreSQL连接包装器，尽量保持原有调用风格。"""
+
+    def __init__(self, dsn: str):
+        self._conn = psycopg.connect(dsn, row_factory=dict_row)
+
+    @staticmethod
+    def _adapt_sql(sql: str) -> str:
+        adapted = sql.replace("datetime('now')", "CURRENT_TIMESTAMP")
+        return adapted.replace("?", "%s")
+
+    def execute(self, sql: str, params: Optional[List[Any] | Tuple[Any, ...]] = None):
+        adapted_sql = self._adapt_sql(sql)
+        if params is None:
+            return self._conn.execute(adapted_sql)
+        return self._conn.execute(adapted_sql, tuple(params))
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._conn.close()
+        return False
+
+
+def get_db_connection() -> PostgresConnection:
+    """获取PostgreSQL连接。"""
+    return PostgresConnection(DATABASE_URL)
+
+
+def get_redis_key(suffix: str) -> str:
+    return f"{REDIS_KEY_PREFIX}:{suffix}"
+
+
+def get_redis_email_cache_key(cache_key: str) -> str:
+    return get_redis_key(f"email-cache:{cache_key}")
+
+
+def get_redis_access_token_key(email_id: str, auth_mode: str) -> str:
+    return get_redis_key(f"access-token:{build_access_token_cache_key(email_id, auth_mode)}")
+
+
+def init_redis_cache_client() -> None:
+    global redis_client
+    if not REDIS_URL:
+        redis_client = None
+        logger.warning("REDIS_URL is empty. Redis cache is disabled.")
+        return
+
+    try:
+        redis_client = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        )
+        redis_client.ping()
+        logger.info("Redis cache connected.")
+    except Exception as e:
+        redis_client = None
+        logger.warning(f"Redis unavailable, fallback to local memory cache: {e}")
+
+
 def get_cache_key(email: str, auth_mode: str, folder: str, page: int, page_size: int) -> str:
     """
     生成缓存键
@@ -407,22 +553,36 @@ def get_cached_emails(cache_key: str, force_refresh: bool = False):
     Returns:
         缓存的数据或None
     """
+    redis_key = get_redis_email_cache_key(cache_key)
+
     if force_refresh:
-        # 强制刷新，删除现有缓存
+        if redis_client:
+            try:
+                redis_client.delete(redis_key)
+            except Exception as e:
+                logger.warning(f"Failed to clear Redis email cache {cache_key}: {e}")
+
         if cache_key in email_cache:
             del email_cache[cache_key]
-            logger.debug(f"Force refresh: removed cache for {cache_key}")
+            logger.debug(f"Force refresh: removed memory cache for {cache_key}")
         return None
+
+    if redis_client:
+        try:
+            cached_raw = redis_client.get(redis_key)
+            if cached_raw:
+                payload = json.loads(cached_raw)
+                return EmailListResponse(**payload)
+        except Exception as e:
+            logger.warning(f"Redis cache read failed for {cache_key}: {e}")
 
     if cache_key in email_cache:
         cached_data, timestamp = email_cache[cache_key]
         if time.time() - timestamp < CACHE_EXPIRE_TIME:
-            logger.debug(f"Cache hit for {cache_key}")
+            logger.debug(f"Memory cache hit for {cache_key}")
             return cached_data
-        else:
-            # 缓存已过期，删除
-            del email_cache[cache_key]
-            logger.debug(f"Cache expired for {cache_key}")
+        del email_cache[cache_key]
+        logger.debug(f"Memory cache expired for {cache_key}")
 
     return None
 
@@ -436,6 +596,18 @@ def set_cached_emails(cache_key: str, data) -> None:
         data: 要缓存的数据
     """
     email_cache[cache_key] = (data, time.time())
+
+    if redis_client:
+        redis_key = get_redis_email_cache_key(cache_key)
+        try:
+            if hasattr(data, "model_dump"):
+                payload = data.model_dump()
+            else:
+                payload = data
+            redis_client.setex(redis_key, CACHE_EXPIRE_TIME, json.dumps(payload, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"Redis cache write failed for {cache_key}: {e}")
+
     logger.debug(f"Cache set for {cache_key}")
 
 
@@ -447,17 +619,35 @@ def clear_email_cache(email: str = None) -> None:
         email: 指定邮箱地址，如果为None则清除所有缓存
     """
     if email:
-        # 清除特定邮箱的缓存
         keys_to_delete = [key for key in email_cache.keys() if key.startswith(f"{email}:")]
         for key in keys_to_delete:
             del email_cache[key]
-        logger.info(f"Cleared cache for {email} ({len(keys_to_delete)} entries)")
-    else:
-        # 清除所有缓存
-        cache_count = len(email_cache)
-        email_cache.clear()
-        email_count_cache.clear()
-        logger.info(f"Cleared all email cache ({cache_count} entries)")
+
+        if redis_client:
+            prefix = get_redis_email_cache_key(f"{email}:")
+            try:
+                matched_keys = list(redis_client.scan_iter(match=f"{prefix}*"))
+                if matched_keys:
+                    redis_client.delete(*matched_keys)
+            except Exception as e:
+                logger.warning(f"Failed to clear Redis cache for {email}: {e}")
+
+        logger.info(f"Cleared cache for {email} ({len(keys_to_delete)} memory entries)")
+        return
+
+    cache_count = len(email_cache)
+    email_cache.clear()
+    email_count_cache.clear()
+
+    if redis_client:
+        try:
+            matched_keys = list(redis_client.scan_iter(match=f"{get_redis_key('email-cache:')}*"))
+            if matched_keys:
+                redis_client.delete(*matched_keys)
+        except Exception as e:
+            logger.warning(f"Failed to clear all Redis email cache: {e}")
+
+    logger.info(f"Cleared all email cache ({cache_count} memory entries)")
 
 
 def normalize_auth_mode(auth_mode: Optional[str], default: str = "imap") -> str:
@@ -509,13 +699,6 @@ def get_graph_folders_by_view(folder_view: str) -> List[tuple[str, str]]:
     return [("inbox", "inbox"), ("junk", "junkemail")]
 
 
-def get_db_connection() -> sqlite3.Connection:
-    """获取SQLite连接"""
-    conn = sqlite3.connect(ACCOUNTS_DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def normalize_email(email_id: str) -> str:
     return email_id.strip().lower()
 
@@ -539,10 +722,151 @@ def serialize_tags(tags: Optional[List[str]]) -> str:
     return json.dumps(clean_tags, ensure_ascii=False)
 
 
+def normalize_token_refresh_unit(unit: Optional[str], default: str = "hour") -> str:
+    normalized = (unit or "").strip().lower()
+    if normalized in TOKEN_REFRESH_SUPPORTED_UNITS:
+        return normalized
+    return default
+
+
+def token_refresh_interval_to_seconds(interval_value: int, interval_unit: str) -> int:
+    normalized_unit = normalize_token_refresh_unit(interval_unit)
+    if normalized_unit == "day":
+        return interval_value * 24 * 3600
+    if normalized_unit == "hour":
+        return interval_value * 3600
+    return interval_value * 60
+
+
+def datetime_to_utc_iso(timestamp: Optional[int]) -> Optional[str]:
+    if timestamp is None:
+        return None
+    try:
+        parsed = int(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return datetime.fromtimestamp(parsed, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def ensure_table_column(conn: PostgresConnection, table_name: str, column_name: str, column_sql: str) -> None:
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {column_sql}")
+
+
+def build_access_token_cache_key(email_id: str, auth_mode: str) -> str:
+    return f"{normalize_email(email_id)}::{normalize_auth_mode(auth_mode, default='imap')}"
+
+
+def get_cached_access_token(email_id: str, auth_mode: str) -> Tuple[Optional[str], Optional[int]]:
+    cache_key = build_access_token_cache_key(email_id, auth_mode)
+    redis_key = get_redis_access_token_key(email_id, auth_mode)
+
+    if redis_client:
+        try:
+            cached_raw = redis_client.get(redis_key)
+            if cached_raw:
+                payload = json.loads(cached_raw)
+                token_value = str(payload.get("token") or "").strip()
+                expires_at = safe_int(payload.get("expires_at"))
+                if token_value and expires_at:
+                    access_token_cache[cache_key] = {
+                        "token": token_value,
+                        "expires_at": expires_at,
+                        "updated_at": int(time.time()),
+                    }
+                    return token_value, expires_at
+        except Exception as e:
+            logger.warning(f"Failed to read Redis access token cache {cache_key}: {e}")
+
+    cached = access_token_cache.get(cache_key)
+    if not cached:
+        return None, None
+
+    token_value = str(cached.get("token") or "").strip()
+    expires_at = safe_int(cached.get("expires_at"))
+    if not token_value or not expires_at:
+        access_token_cache.pop(cache_key, None)
+        return None, None
+
+    if expires_at <= int(time.time()):
+        access_token_cache.pop(cache_key, None)
+        return None, None
+
+    return token_value, expires_at
+
+
+def set_cached_access_token(email_id: str, auth_mode: str, token: str, expires_at: int) -> None:
+    cache_key = build_access_token_cache_key(email_id, auth_mode)
+    now_ts = int(time.time())
+    access_token_cache[cache_key] = {
+        "token": token,
+        "expires_at": int(expires_at),
+        "updated_at": now_ts
+    }
+
+    if redis_client:
+        redis_key = get_redis_access_token_key(email_id, auth_mode)
+        ttl = max(1, int(expires_at) - now_ts)
+        payload = {
+            "token": token,
+            "expires_at": int(expires_at),
+            "updated_at": now_ts,
+        }
+        try:
+            redis_client.setex(redis_key, ttl, json.dumps(payload, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"Failed to write Redis access token cache {cache_key}: {e}")
+
+
+def clear_cached_access_token(email_id: str, auth_mode: str) -> None:
+    cache_key = build_access_token_cache_key(email_id, auth_mode)
+    access_token_cache.pop(cache_key, None)
+    if redis_client:
+        redis_key = get_redis_access_token_key(email_id, auth_mode)
+        try:
+            redis_client.delete(redis_key)
+        except Exception as e:
+            logger.warning(f"Failed to clear Redis access token cache {cache_key}: {e}")
+    task = access_token_background_tasks.pop(cache_key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def get_access_token_refresh_lock(email_id: str, auth_mode: str) -> asyncio.Lock:
+    cache_key = build_access_token_cache_key(email_id, auth_mode)
+    existing = access_token_refresh_locks.get(cache_key)
+    if existing:
+        return existing
+    new_lock = asyncio.Lock()
+    access_token_refresh_locks[cache_key] = new_lock
+    return new_lock
+
+
+def should_background_refresh_access_token(expires_at: int, now_ts: int) -> bool:
+    return (expires_at - now_ts) <= max(60, ACCESS_TOKEN_BACKGROUND_REFRESH_SECONDS)
+
+
+def should_force_refresh_access_token(expires_at: int, now_ts: int) -> bool:
+    return (expires_at - now_ts) <= max(5, ACCESS_TOKEN_FORCE_REFRESH_SECONDS)
+
+
 def init_account_db() -> None:
     """初始化账户数据库"""
     try:
         with get_db_connection() as conn:
+            now_ts = int(time.time())
+            default_rt_expires_at = now_ts + DEFAULT_ACCOUNT_RT_TTL_SECONDS
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -552,11 +876,18 @@ def init_account_db() -> None:
                     client_id TEXT NOT NULL,
                     auth_mode TEXT NOT NULL DEFAULT 'imap',
                     tags TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    access_token_expires_at INTEGER,
+                    refresh_token_expires_at INTEGER,
+                    token_last_refreshed_at INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            ensure_table_column(conn, "accounts", "access_token_expires_at", "INTEGER")
+            ensure_table_column(conn, "accounts", "refresh_token_expires_at", "INTEGER")
+            ensure_table_column(conn, "accounts", "token_last_refreshed_at", "INTEGER")
+
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_accounts_mailbox_password
@@ -571,13 +902,81 @@ def init_account_db() -> None:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_accounts_rt_expires
+                ON accounts (refresh_token_expires_at)
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS token_refresh_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    interval_value INTEGER NOT NULL DEFAULT 12,
+                    interval_unit TEXT NOT NULL DEFAULT 'hour',
+                    next_run_at INTEGER,
+                    last_run_at INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            ensure_table_column(conn, "token_refresh_settings", "enabled", "INTEGER NOT NULL DEFAULT 0")
+            ensure_table_column(conn, "token_refresh_settings", "interval_value", "INTEGER NOT NULL DEFAULT 12")
+            ensure_table_column(conn, "token_refresh_settings", "interval_unit", "TEXT NOT NULL DEFAULT 'hour'")
+            ensure_table_column(conn, "token_refresh_settings", "next_run_at", "INTEGER")
+            ensure_table_column(conn, "token_refresh_settings", "last_run_at", "INTEGER")
+
+            conn.execute(
+                """
+                INSERT INTO token_refresh_settings (
+                    id, enabled, interval_value, interval_unit, next_run_at, last_run_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    1,
+                    0,
+                    max(1, TOKEN_REFRESH_DEFAULT_INTERVAL_VALUE),
+                    normalize_token_refresh_unit(TOKEN_REFRESH_DEFAULT_INTERVAL_UNIT)
+                )
+            )
+
+            conn.execute(
+                """
+                UPDATE token_refresh_settings
+                SET interval_unit = ?, updated_at = datetime('now')
+                WHERE interval_unit NOT IN ('minute', 'hour', 'day')
+                """,
+                (normalize_token_refresh_unit(TOKEN_REFRESH_DEFAULT_INTERVAL_UNIT),)
+            )
+            conn.execute(
+                """
+                UPDATE token_refresh_settings
+                SET interval_value = ?, updated_at = datetime('now')
+                WHERE interval_value IS NULL OR interval_value < 1
+                """,
+                (max(1, TOKEN_REFRESH_DEFAULT_INTERVAL_VALUE),)
+            )
+
+            conn.execute(
+                """
+                UPDATE accounts
+                SET refresh_token_expires_at = ?, updated_at = datetime('now')
+                WHERE refresh_token_expires_at IS NULL OR refresh_token_expires_at <= 0
+                """,
+                (default_rt_expires_at,)
+            )
+
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS admin_sessions (
                     refresh_token_hash TEXT PRIMARY KEY,
                     access_token_hash TEXT NOT NULL,
                     access_expires_at INTEGER NOT NULL,
                     refresh_expires_at INTEGER NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -589,8 +988,108 @@ def init_account_db() -> None:
             )
             conn.commit()
     except Exception as e:
-        logger.error(f"Failed to initialize accounts database {ACCOUNTS_DB_FILE}: {e}")
+        logger.error(f"Failed to initialize PostgreSQL schema: {e}")
         raise
+
+
+def get_token_refresh_settings_row(conn: PostgresConnection) -> Dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT enabled, interval_value, interval_unit, next_run_at, last_run_at
+        FROM token_refresh_settings
+        WHERE id = 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        return row
+
+    conn.execute(
+        """
+        INSERT INTO token_refresh_settings (id, enabled, interval_value, interval_unit)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        (
+            1,
+            0,
+            max(1, TOKEN_REFRESH_DEFAULT_INTERVAL_VALUE),
+            normalize_token_refresh_unit(TOKEN_REFRESH_DEFAULT_INTERVAL_UNIT)
+        )
+    )
+    conn.commit()
+    return conn.execute(
+        """
+        SELECT enabled, interval_value, interval_unit, next_run_at, last_run_at
+        FROM token_refresh_settings
+        WHERE id = 1
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def build_token_refresh_settings_response(row: Dict[str, Any]) -> TokenRefreshSettingsResponse:
+    return TokenRefreshSettingsResponse(
+        enabled=bool(int(row["enabled"] or 0)),
+        interval_value=max(1, int(row["interval_value"] or 1)),
+        interval_unit=normalize_token_refresh_unit(row["interval_unit"]),
+        next_run_at=datetime_to_utc_iso(safe_int(row["next_run_at"])),
+        last_run_at=datetime_to_utc_iso(safe_int(row["last_run_at"]))
+    )
+
+
+def get_token_refresh_settings() -> TokenRefreshSettingsResponse:
+    with get_db_connection() as conn:
+        row = get_token_refresh_settings_row(conn)
+        return build_token_refresh_settings_response(row)
+
+
+def compute_next_token_refresh_at(interval_value: int, interval_unit: str, base_ts: Optional[int] = None) -> int:
+    start_ts = base_ts if base_ts is not None else int(time.time())
+    safe_interval = max(1, int(interval_value))
+    interval_seconds = token_refresh_interval_to_seconds(safe_interval, interval_unit)
+    return start_ts + interval_seconds
+
+
+def set_token_refresh_settings(
+    enabled: bool,
+    interval_value: int,
+    interval_unit: str
+) -> TokenRefreshSettingsResponse:
+    safe_interval = max(1, int(interval_value))
+    safe_unit = normalize_token_refresh_unit(interval_unit)
+    now_ts = int(time.time())
+    next_run_at = compute_next_token_refresh_at(safe_interval, safe_unit, now_ts) if enabled else None
+
+    with get_db_connection() as conn:
+        get_token_refresh_settings_row(conn)
+        conn.execute(
+            """
+            UPDATE token_refresh_settings
+            SET enabled = ?, interval_value = ?, interval_unit = ?, next_run_at = ?, updated_at = datetime('now')
+            WHERE id = 1
+            """,
+            (1 if enabled else 0, safe_interval, safe_unit, next_run_at)
+        )
+        conn.commit()
+        row = get_token_refresh_settings_row(conn)
+        return build_token_refresh_settings_response(row)
+
+
+def mark_token_refresh_run_completed(interval_value: int, interval_unit: str, enabled: bool) -> None:
+    now_ts = int(time.time())
+    next_run_at = compute_next_token_refresh_at(interval_value, interval_unit, now_ts) if enabled else None
+    with get_db_connection() as conn:
+        get_token_refresh_settings_row(conn)
+        conn.execute(
+            """
+            UPDATE token_refresh_settings
+            SET last_run_at = ?, next_run_at = ?, updated_at = datetime('now')
+            WHERE id = 1
+            """,
+            (now_ts, next_run_at)
+        )
+        conn.commit()
 
 
 def hash_admin_token(token: str) -> str:
@@ -618,9 +1117,14 @@ def create_admin_session_tokens() -> tuple[str, str]:
     with get_db_connection() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO admin_sessions (
+            INSERT INTO admin_sessions (
                 refresh_token_hash, access_token_hash, access_expires_at, refresh_expires_at, updated_at
             ) VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT (refresh_token_hash) DO UPDATE SET
+                access_token_hash = EXCLUDED.access_token_hash,
+                access_expires_at = EXCLUDED.access_expires_at,
+                refresh_expires_at = EXCLUDED.refresh_expires_at,
+                updated_at = CURRENT_TIMESTAMP
             """,
             (
                 refresh_token_hash,
@@ -783,7 +1287,7 @@ def render_admin_login_page(error_message: Optional[str] = None) -> str:
 """
 
 
-def row_to_credentials(row: sqlite3.Row) -> AccountCredentials:
+def row_to_credentials(row: Dict[str, Any]) -> AccountCredentials:
     """数据库行转换为凭证对象"""
     return AccountCredentials(
         email=row["email_id"],
@@ -818,12 +1322,78 @@ def get_account_credentials_by_email_and_password(
                 (normalized_email, normalized_password)
             ).fetchone()
     except Exception as e:
-        logger.error(f"Failed to query account by email/password from sqlite: {e}")
+        logger.error(f"Failed to query account by email/password from PostgreSQL: {e}")
         return None
 
     if not row:
         return None
     return row_to_credentials(row)
+
+
+def update_account_token_state(
+    email_id: str,
+    access_token_expires_at: Optional[int] = None,
+    refresh_token_expires_at: Optional[int] = None,
+    refresh_token: Optional[str] = None,
+    auth_mode: Optional[str] = None,
+    mark_refreshed: bool = True
+) -> bool:
+    """更新账户令牌状态，返回账户是否存在。"""
+    normalized_email = normalize_email(email_id)
+    if not normalized_email:
+        return False
+
+    assignments: List[str] = []
+    params: List[Any] = []
+
+    if access_token_expires_at is not None:
+        assignments.append("access_token_expires_at = ?")
+        params.append(int(access_token_expires_at))
+
+    if refresh_token_expires_at is not None:
+        assignments.append("refresh_token_expires_at = ?")
+        params.append(int(refresh_token_expires_at))
+
+    if refresh_token:
+        assignments.append("refresh_token = ?")
+        params.append(refresh_token)
+
+    if auth_mode:
+        assignments.append("auth_mode = ?")
+        params.append(normalize_auth_mode(auth_mode, default="imap"))
+
+    if mark_refreshed:
+        assignments.append("token_last_refreshed_at = ?")
+        params.append(int(time.time()))
+
+    assignments.append("updated_at = datetime('now')")
+
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE accounts SET {', '.join(assignments)} WHERE email_id = ?",
+            params + [normalized_email]
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_account_token_expiry(email_id: str) -> Tuple[Optional[int], Optional[int]]:
+    normalized_email = normalize_email(email_id)
+    if not normalized_email:
+        return None, None
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT access_token_expires_at, refresh_token_expires_at
+            FROM accounts
+            WHERE email_id = ?
+            LIMIT 1
+            """,
+            (normalized_email,)
+        ).fetchone()
+    if not row:
+        return None, None
+    return safe_int(row["access_token_expires_at"]), safe_int(row["refresh_token_expires_at"])
 
 # ============================================================================
 # 邮件处理辅助函数
@@ -935,7 +1505,7 @@ def extract_email_content(email_message: email.message.EmailMessage) -> tuple[st
 
 async def get_account_credentials(email_id: str) -> AccountCredentials:
     """
-    从SQLite获取指定邮箱的账户凭证
+    从PostgreSQL获取指定邮箱的账户凭证
 
     Args:
         email_id: 邮箱地址
@@ -963,7 +1533,7 @@ async def get_account_credentials(email_id: str) -> AccountCredentials:
             ).fetchone()
 
         if not row:
-            logger.warning(f"Account {normalized_email} not found in sqlite")
+            logger.warning(f"Account {normalized_email} not found in PostgreSQL")
             raise HTTPException(status_code=404, detail=f"Account {normalized_email} not found")
 
         return row_to_credentials(row)
@@ -971,12 +1541,12 @@ async def get_account_credentials(email_id: str) -> AccountCredentials:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error getting account credentials for {email_id} from sqlite: {e}")
+        logger.error(f"Unexpected error getting account credentials for {email_id} from PostgreSQL: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def save_account_credentials(email_id: str, credentials: AccountCredentials) -> None:
-    """保存账户凭证到SQLite"""
+    """保存账户凭证到PostgreSQL"""
     try:
         normalized_email = normalize_email(email_id)
         if not normalized_email:
@@ -985,43 +1555,83 @@ async def save_account_credentials(email_id: str, credentials: AccountCredential
         normalized_auth_mode = normalize_auth_mode(credentials.auth_mode, default="imap")
         mailbox_password = (credentials.mailbox_password or "").strip()
         tags_json = serialize_tags(credentials.tags if hasattr(credentials, "tags") else [])
+        now_ts = int(time.time())
+        default_rt_expires_at = now_ts + DEFAULT_ACCOUNT_RT_TTL_SECONDS
 
         with get_db_connection() as conn:
-            if not mailbox_password:
-                existing = conn.execute(
-                    "SELECT mailbox_password FROM accounts WHERE email_id = ?",
-                    (normalized_email,)
-                ).fetchone()
-                if existing and existing["mailbox_password"]:
-                    mailbox_password = existing["mailbox_password"]
-
-            conn.execute(
+            existing = conn.execute(
                 """
-                INSERT INTO accounts (
-                    email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(email_id) DO UPDATE SET
-                    mailbox_password = excluded.mailbox_password,
-                    refresh_token = excluded.refresh_token,
-                    client_id = excluded.client_id,
-                    auth_mode = excluded.auth_mode,
-                    tags = excluded.tags,
-                    updated_at = datetime('now')
+                SELECT mailbox_password, refresh_token, access_token_expires_at,
+                       refresh_token_expires_at, token_last_refreshed_at
+                FROM accounts
+                WHERE email_id = ?
+                LIMIT 1
                 """,
-                (
-                    normalized_email,
-                    mailbox_password,
-                    credentials.refresh_token,
-                    credentials.client_id,
-                    normalized_auth_mode,
-                    tags_json
+                (normalized_email,)
+            ).fetchone()
+
+            if not mailbox_password and existing and existing["mailbox_password"]:
+                mailbox_password = existing["mailbox_password"]
+
+            access_token_expires_at = safe_int(existing["access_token_expires_at"]) if existing else None
+            token_last_refreshed_at = safe_int(existing["token_last_refreshed_at"]) if existing else None
+            existing_rt_expires_at = safe_int(existing["refresh_token_expires_at"]) if existing else None
+            existing_refresh_token = str(existing["refresh_token"]) if existing else None
+
+            if existing_refresh_token and existing_refresh_token == credentials.refresh_token and existing_rt_expires_at:
+                refresh_token_expires_at = existing_rt_expires_at
+            else:
+                refresh_token_expires_at = default_rt_expires_at
+
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET mailbox_password = ?, refresh_token = ?, client_id = ?, auth_mode = ?, tags = ?,
+                        access_token_expires_at = ?, refresh_token_expires_at = ?, token_last_refreshed_at = ?,
+                        updated_at = datetime('now')
+                    WHERE email_id = ?
+                    """,
+                    (
+                        mailbox_password,
+                        credentials.refresh_token,
+                        credentials.client_id,
+                        normalized_auth_mode,
+                        tags_json,
+                        access_token_expires_at,
+                        refresh_token_expires_at,
+                        token_last_refreshed_at,
+                        normalized_email
+                    )
                 )
-            )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO accounts (
+                        email_id, mailbox_password, refresh_token, client_id, auth_mode, tags,
+                        access_token_expires_at, refresh_token_expires_at, token_last_refreshed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_email,
+                        mailbox_password,
+                        credentials.refresh_token,
+                        credentials.client_id,
+                        normalized_auth_mode,
+                        tags_json,
+                        access_token_expires_at,
+                        refresh_token_expires_at,
+                        token_last_refreshed_at
+                    )
+                )
             conn.commit()
 
-        logger.info(f"Account credentials saved to sqlite for {normalized_email}")
+        # 凭证被修改后，清理旧AT缓存，避免继续使用过时token
+        clear_cached_access_token(normalized_email, "imap")
+        clear_cached_access_token(normalized_email, "graph")
+        logger.info(f"Account credentials saved to PostgreSQL for {normalized_email}")
     except Exception as e:
-        logger.error(f"Error saving account credentials to sqlite: {e}")
+        logger.error(f"Error saving account credentials to PostgreSQL: {e}")
         raise HTTPException(status_code=500, detail="Failed to save account")
 
 
@@ -1055,7 +1665,8 @@ async def get_all_accounts(
 
             rows = conn.execute(
                 f"""
-                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags
+                SELECT email_id, mailbox_password, refresh_token, client_id, auth_mode, tags,
+                       access_token_expires_at, refresh_token_expires_at
                 FROM accounts
                 WHERE {where_sql}
                 ORDER BY updated_at DESC
@@ -1065,12 +1676,17 @@ async def get_all_accounts(
             ).fetchall()
 
         total_pages = (total_accounts + page_size - 1) // page_size if total_accounts > 0 else 0
+        now_ts = int(time.time())
 
         paginated_accounts: List[AccountInfo] = []
         for row in rows:
             status = "active"
             if not row["refresh_token"] or not row["client_id"]:
                 status = "invalid"
+            else:
+                rt_expires_at = safe_int(row["refresh_token_expires_at"])
+                if rt_expires_at is not None and rt_expires_at <= now_ts:
+                    status = "expired"
 
             paginated_accounts.append(
                 AccountInfo(
@@ -1078,7 +1694,9 @@ async def get_all_accounts(
                     client_id=row["client_id"],
                     auth_mode=normalize_auth_mode(row["auth_mode"], default="imap"),
                     status=status,
-                    tags=parse_tags(row["tags"])
+                    tags=parse_tags(row["tags"]),
+                    access_token_expires_at=datetime_to_utc_iso(safe_int(row["access_token_expires_at"])),
+                    refresh_token_expires_at=datetime_to_utc_iso(safe_int(row["refresh_token_expires_at"]))
                 )
             )
 
@@ -1091,7 +1709,7 @@ async def get_all_accounts(
         )
 
     except Exception as e:
-        logger.error(f"Error getting accounts list from sqlite: {e}")
+        logger.error(f"Error getting accounts list from PostgreSQL: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -1099,24 +1717,33 @@ async def get_all_accounts(
 # OAuth2令牌管理模块
 # ============================================================================
 
-async def get_access_token(credentials: AccountCredentials, auth_mode: str = "imap") -> str:
-    """
-    使用refresh_token获取access_token
+def get_payload_positive_int(payload: Dict[str, Any], keys: List[str], default_value: int) -> int:
+    for key in keys:
+        value = safe_int(payload.get(key))
+        if value and value > 0:
+            return value
+    return default_value
 
-    Args:
-        credentials: 账户凭证信息
-        auth_mode: 认证模式（imap/graph）
 
-    Returns:
-        str: OAuth2访问令牌
+def get_access_token_ttl_seconds(token_payload: Dict[str, Any]) -> int:
+    ttl = get_payload_positive_int(token_payload, ["expires_in", "ext_expires_in"], DEFAULT_ACCESS_TOKEN_TTL_SECONDS)
+    return max(60, ttl)
 
-    Raises:
-        HTTPException: 令牌获取失败
-    """
+
+def get_refresh_token_ttl_seconds(token_payload: Dict[str, Any]) -> int:
+    ttl = get_payload_positive_int(
+        token_payload,
+        ["refresh_token_expires_in", "refresh_expires_in", "refresh_token_ttl"],
+        DEFAULT_ACCOUNT_RT_TTL_SECONDS
+    )
+    return max(60, ttl)
+
+
+async def request_access_token_payload(credentials: AccountCredentials, auth_mode: str = "imap") -> Dict[str, Any]:
+    """向微软令牌端点请求token原始响应。"""
     normalized_mode = normalize_auth_mode(auth_mode, default="imap")
     oauth_scope = get_scope_for_auth_mode(normalized_mode)
 
-    # 构建OAuth2请求数据
     token_request_data = {
         'client_id': credentials.client_id,
         'grant_type': 'refresh_token',
@@ -1125,15 +1752,12 @@ async def get_access_token(credentials: AccountCredentials, auth_mode: str = "im
     }
 
     try:
-        # 发送令牌请求
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(TOKEN_URL, data=token_request_data)
             response.raise_for_status()
 
-            # 解析响应
             token_data = response.json()
             access_token = token_data.get('access_token')
-
             if not access_token:
                 logger.error(f"No access token in response for {credentials.email} with mode={normalized_mode}")
                 raise HTTPException(
@@ -1142,7 +1766,7 @@ async def get_access_token(credentials: AccountCredentials, auth_mode: str = "im
                 )
 
             logger.info(f"Successfully obtained access token for {credentials.email} with mode={normalized_mode}")
-            return access_token
+            return token_data
 
     except httpx.HTTPStatusError as e:
         error_code = None
@@ -1174,14 +1798,158 @@ async def get_access_token(credentials: AccountCredentials, auth_mode: str = "im
             if error_description:
                 detail += f" ({error_description})"
             raise HTTPException(status_code=401, detail=detail)
-        else:
-            raise HTTPException(status_code=401, detail=f"Authentication failed ({normalized_mode})")
+        raise HTTPException(status_code=401, detail=f"Authentication failed ({normalized_mode})")
     except httpx.RequestError as e:
         logger.error(f"Request error getting access token for {credentials.email} with mode={normalized_mode}: {e}")
         raise HTTPException(status_code=500, detail="Network error during token acquisition")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error getting access token for {credentials.email} with mode={normalized_mode}: {e}")
         raise HTTPException(status_code=500, detail="Token acquisition failed")
+
+
+async def acquire_access_token_with_mode(
+    credentials: AccountCredentials,
+    requested_mode: str = "auto"
+) -> Tuple[str, str, Dict[str, Any]]:
+    """获取(access_token, 实际认证模式, token响应)。"""
+    normalized_mode = normalize_auth_mode(requested_mode, default="auto")
+
+    if normalized_mode in {"imap", "graph"}:
+        payload = await request_access_token_payload(credentials, normalized_mode)
+        return str(payload["access_token"]), normalized_mode, payload
+
+    imap_error: Optional[HTTPException] = None
+    try:
+        payload = await request_access_token_payload(credentials, "imap")
+        return str(payload["access_token"]), "imap", payload
+    except HTTPException as e:
+        imap_error = e
+
+    try:
+        payload = await request_access_token_payload(credentials, "graph")
+        return str(payload["access_token"]), "graph", payload
+    except HTTPException as graph_error:
+        imap_detail = imap_error.detail if imap_error else "unknown"
+        raise HTTPException(
+            status_code=401,
+            detail=f"IMAP verification failed: {imap_detail}; Graph verification failed: {graph_error.detail}"
+        )
+
+
+async def fetch_and_persist_access_token(
+    credentials: AccountCredentials,
+    requested_mode: str = "imap",
+    extend_refresh_expires_at: bool = False
+) -> Tuple[str, str, int]:
+    """使用RT获取AT并写入数据库/缓存，返回(access_token, used_mode, access_expires_at)。"""
+    access_token, used_mode, token_payload = await acquire_access_token_with_mode(credentials, requested_mode)
+    if not access_token:
+        raise HTTPException(status_code=500, detail="Failed to refresh token")
+
+    now_ts = int(time.time())
+    access_expires_at = now_ts + get_access_token_ttl_seconds(token_payload)
+    refresh_token_value = token_payload.get("refresh_token")
+    refresh_expires_at: Optional[int] = None
+
+    if extend_refresh_expires_at or refresh_token_value:
+        refresh_expires_at = now_ts + get_refresh_token_ttl_seconds(token_payload)
+
+    if refresh_token_value:
+        credentials.refresh_token = str(refresh_token_value)
+
+    update_account_token_state(
+        credentials.email,
+        access_token_expires_at=access_expires_at,
+        refresh_token_expires_at=refresh_expires_at,
+        refresh_token=str(refresh_token_value) if refresh_token_value else None,
+        auth_mode=used_mode,
+        mark_refreshed=True
+    )
+    set_cached_access_token(str(credentials.email), used_mode, access_token, access_expires_at)
+    return access_token, used_mode, access_expires_at
+
+
+async def _background_refresh_access_token(email_id: str, auth_mode: str) -> None:
+    normalized_mode = normalize_auth_mode(auth_mode, default="imap")
+    cache_key = build_access_token_cache_key(email_id, normalized_mode)
+    try:
+        lock = get_access_token_refresh_lock(email_id, normalized_mode)
+        async with lock:
+            now_ts = int(time.time())
+            cached_token, cached_expires_at = get_cached_access_token(email_id, normalized_mode)
+            if cached_token and cached_expires_at and not should_background_refresh_access_token(cached_expires_at, now_ts):
+                return
+
+            latest_credentials = await get_account_credentials(email_id)
+            await fetch_and_persist_access_token(
+                latest_credentials,
+                requested_mode=normalized_mode,
+                extend_refresh_expires_at=False
+            )
+            logger.info(f"Background access token refresh completed for {normalize_email(email_id)} mode={normalized_mode}")
+    except Exception as e:
+        logger.warning(f"Background access token refresh failed for {normalize_email(email_id)} mode={normalized_mode}: {e}")
+    finally:
+        access_token_background_tasks.pop(cache_key, None)
+
+
+def schedule_background_access_token_refresh(email_id: str, auth_mode: str) -> None:
+    normalized_mode = normalize_auth_mode(auth_mode, default="imap")
+    if normalized_mode not in {"imap", "graph"}:
+        return
+
+    cache_key = build_access_token_cache_key(email_id, normalized_mode)
+    running_task = access_token_background_tasks.get(cache_key)
+    if running_task and not running_task.done():
+        return
+    access_token_background_tasks[cache_key] = asyncio.create_task(
+        _background_refresh_access_token(email_id, normalized_mode)
+    )
+
+
+async def get_access_token(credentials: AccountCredentials, auth_mode: str = "imap") -> str:
+    """
+    优先复用缓存AT；仅在快过期/已过期时使用RT刷新AT。
+    """
+    requested_mode = normalize_auth_mode(auth_mode, default="imap")
+
+    if requested_mode not in {"imap", "graph"}:
+        access_token, _, _ = await fetch_and_persist_access_token(
+            credentials,
+            requested_mode=requested_mode,
+            extend_refresh_expires_at=False
+        )
+        return access_token
+
+    now_ts = int(time.time())
+    cached_token, cached_expires_at = get_cached_access_token(str(credentials.email), requested_mode)
+    if cached_token and cached_expires_at and not should_force_refresh_access_token(cached_expires_at, now_ts):
+        if should_background_refresh_access_token(cached_expires_at, now_ts):
+            schedule_background_access_token_refresh(str(credentials.email), requested_mode)
+        return cached_token
+
+    refresh_lock = get_access_token_refresh_lock(str(credentials.email), requested_mode)
+    async with refresh_lock:
+        now_ts = int(time.time())
+        cached_token, cached_expires_at = get_cached_access_token(str(credentials.email), requested_mode)
+        if cached_token and cached_expires_at and not should_force_refresh_access_token(cached_expires_at, now_ts):
+            if should_background_refresh_access_token(cached_expires_at, now_ts):
+                schedule_background_access_token_refresh(str(credentials.email), requested_mode)
+            return cached_token
+
+        latest_credentials = await get_account_credentials(str(credentials.email))
+        access_token, _, _ = await fetch_and_persist_access_token(
+            latest_credentials,
+            requested_mode=requested_mode,
+            extend_refresh_expires_at=False
+        )
+
+        # 将数据库最新refresh_token回写到当前上下文对象，避免后续请求使用旧RT
+        credentials.refresh_token = latest_credentials.refresh_token
+        credentials.auth_mode = latest_credentials.auth_mode
+        return access_token
 
 
 async def resolve_account_auth_mode(credentials: AccountCredentials) -> str:
@@ -1189,27 +1957,71 @@ async def resolve_account_auth_mode(credentials: AccountCredentials) -> str:
     自动解析账户认证模式。
     auto模式下优先尝试IMAP，失败后回退Graph。
     """
-    requested_mode = normalize_auth_mode(credentials.auth_mode, default="auto")
+    _, used_mode, _ = await acquire_access_token_with_mode(credentials, credentials.auth_mode)
+    return used_mode
 
-    if requested_mode in {"imap", "graph"}:
-        await get_access_token(credentials, requested_mode)
-        return requested_mode
 
-    imap_error = None
-    try:
-        await get_access_token(credentials, "imap")
-        return "imap"
-    except HTTPException as e:
-        imap_error = e
+async def refresh_account_tokens_by_email(
+    email_id: str,
+    extend_refresh_expires_at: bool = True,
+    preferred_mode: Optional[str] = None
+) -> TokenRefreshAccountResponse:
+    """刷新指定账户AT，按需刷新RT过期时间。"""
+    credentials = await get_account_credentials(email_id)
+    requested_mode = preferred_mode if preferred_mode else credentials.auth_mode
+    _, used_mode, _ = await fetch_and_persist_access_token(
+        credentials,
+        requested_mode=requested_mode,
+        extend_refresh_expires_at=extend_refresh_expires_at
+    )
 
-    try:
-        await get_access_token(credentials, "graph")
-        return "graph"
-    except HTTPException as graph_error:
-        raise HTTPException(
-            status_code=401,
-            detail=f"IMAP verification failed: {imap_error.detail}; Graph verification failed: {graph_error.detail}"
-        )
+    stored_access_expires_at, stored_refresh_expires_at = get_account_token_expiry(credentials.email)
+    return TokenRefreshAccountResponse(
+        email_id=normalize_email(email_id),
+        auth_mode=used_mode,
+        access_token_expires_at=datetime_to_utc_iso(stored_access_expires_at),
+        refresh_token_expires_at=datetime_to_utc_iso(stored_refresh_expires_at),
+        message="Token refreshed successfully."
+    )
+
+
+async def refresh_all_accounts_tokens(extend_refresh_expires_at: bool = True) -> TokenRefreshAllResponse:
+    """刷新所有账户的令牌。"""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT email_id, auth_mode FROM accounts ORDER BY updated_at DESC"
+        ).fetchall()
+
+    total_accounts = len(rows)
+    success_count = 0
+    failure_count = 0
+    details: List[str] = []
+
+    for row in rows:
+        email_id = row["email_id"]
+        auth_mode = normalize_auth_mode(row["auth_mode"], default="auto")
+        try:
+            await refresh_account_tokens_by_email(
+                email_id=email_id,
+                extend_refresh_expires_at=extend_refresh_expires_at,
+                preferred_mode=auth_mode
+            )
+            success_count += 1
+        except HTTPException as e:
+            failure_count += 1
+            details.append(f"{email_id}: {e.detail}")
+        except Exception as e:
+            failure_count += 1
+            details.append(f"{email_id}: {str(e)}")
+
+    message = f"Refreshed {success_count}/{total_accounts} account tokens."
+    return TokenRefreshAllResponse(
+        total_accounts=total_accounts,
+        success_count=success_count,
+        failure_count=failure_count,
+        message=message,
+        details=details
+    )
 
 
 # ============================================================================
@@ -1625,6 +2437,51 @@ async def get_email_details(credentials: AccountCredentials, message_id: str) ->
     return await get_email_details_imap(credentials, message_id)
 
 
+async def run_refresh_all_accounts_with_lock(extend_refresh_expires_at: bool = True) -> TokenRefreshAllResponse:
+    global token_refresh_run_lock
+    if token_refresh_run_lock is None:
+        token_refresh_run_lock = asyncio.Lock()
+    async with token_refresh_run_lock:
+        return await refresh_all_accounts_tokens(extend_refresh_expires_at=extend_refresh_expires_at)
+
+
+async def maybe_run_scheduled_token_refresh() -> Optional[TokenRefreshAllResponse]:
+    now_ts = int(time.time())
+    with get_db_connection() as conn:
+        row = get_token_refresh_settings_row(conn)
+        enabled = bool(int(row["enabled"] or 0))
+        if not enabled:
+            return None
+
+        interval_value = max(1, int(row["interval_value"] or 1))
+        interval_unit = normalize_token_refresh_unit(row["interval_unit"])
+        next_run_at = safe_int(row["next_run_at"])
+        if next_run_at and next_run_at > now_ts:
+            return None
+
+    refresh_result = await run_refresh_all_accounts_with_lock(extend_refresh_expires_at=True)
+    mark_token_refresh_run_completed(interval_value, interval_unit, enabled=True)
+    return refresh_result
+
+
+async def token_refresh_scheduler_loop(stop_event: asyncio.Event) -> None:
+    """后台定时任务：到点自动刷新全部账户RT。"""
+    logger.info("Token refresh scheduler started.")
+    try:
+        while not stop_event.is_set():
+            try:
+                await maybe_run_scheduled_token_refresh()
+            except Exception as e:
+                logger.error(f"Token refresh scheduler error: {e}")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=max(5, TOKEN_REFRESH_SCHEDULER_CHECK_SECONDS))
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        logger.info("Token refresh scheduler stopped.")
+
+
 # ============================================================================
 # FastAPI应用和API端点
 # ============================================================================
@@ -1639,15 +2496,38 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     # 应用启动
     logger.info("Starting Outlook Email Management System...")
     init_account_db()
-    logger.info(f"SQLite account database initialized at {ACCOUNTS_DB_FILE}")
+    logger.info("PostgreSQL schema initialization completed")
+    init_redis_cache_client()
     if ADMIN_PASSWORD == "change_me_admin_password":
         logger.warning("ADMIN_PASSWORD is using default value. Please set ADMIN_PASSWORD in environment.")
     logger.info(f"IMAP connection pool initialized with max_connections={MAX_CONNECTIONS}")
+    global token_refresh_scheduler_task, token_refresh_scheduler_stop_event, token_refresh_run_lock
+    token_refresh_run_lock = asyncio.Lock()
+    token_refresh_scheduler_stop_event = asyncio.Event()
+    token_refresh_scheduler_task = asyncio.create_task(token_refresh_scheduler_loop(token_refresh_scheduler_stop_event))
 
     yield
 
     # 应用关闭
     logger.info("Shutting down Outlook Email Management System...")
+    if token_refresh_scheduler_stop_event:
+        token_refresh_scheduler_stop_event.set()
+    if token_refresh_scheduler_task:
+        try:
+            await token_refresh_scheduler_task
+        except Exception:
+            pass
+    for background_task in list(access_token_background_tasks.values()):
+        if background_task and not background_task.done():
+            background_task.cancel()
+    access_token_background_tasks.clear()
+    access_token_cache.clear()
+    access_token_refresh_locks.clear()
+    if redis_client:
+        try:
+            redis_client.close()
+        except Exception:
+            pass
     logger.info("Closing IMAP connection pool...")
     imap_pool.close_all_connections()
     logger.info("Application shutdown complete.")
@@ -1718,6 +2598,37 @@ async def get_accounts(
     return await get_all_accounts(page, page_size, email_search, tag_search)
 
 
+@app.get("/token-refresh/settings", response_model=TokenRefreshSettingsResponse)
+async def get_rt_refresh_settings():
+    """获取RT定时刷新配置。"""
+    return get_token_refresh_settings()
+
+
+@app.put("/token-refresh/settings", response_model=TokenRefreshSettingsResponse)
+async def update_rt_refresh_settings(request: TokenRefreshSettingsUpdateRequest):
+    """更新RT定时刷新配置。"""
+    return set_token_refresh_settings(
+        enabled=request.enabled,
+        interval_value=request.interval_value,
+        interval_unit=request.interval_unit
+    )
+
+
+@app.post("/token-refresh/refresh-all", response_model=TokenRefreshAllResponse)
+async def refresh_all_rt_tokens():
+    """立即刷新所有账户RT/AT。"""
+    result = await run_refresh_all_accounts_with_lock(extend_refresh_expires_at=True)
+
+    settings = get_token_refresh_settings()
+    if settings.enabled:
+        mark_token_refresh_run_completed(
+            interval_value=settings.interval_value,
+            interval_unit=settings.interval_unit,
+            enabled=True
+        )
+    return result
+
+
 @app.post("/accounts", response_model=AccountResponse)
 async def register_account(credentials: AccountCredentials):
     """注册或更新邮箱账户"""
@@ -1728,6 +2639,16 @@ async def register_account(credentials: AccountCredentials):
 
         # 保存凭证
         await save_account_credentials(credentials.email, credentials)
+
+        # 初始化AT/RT过期时间（不阻断注册流程）
+        try:
+            await refresh_account_tokens_by_email(
+                email_id=str(credentials.email),
+                extend_refresh_expires_at=True,
+                preferred_mode=resolved_mode
+            )
+        except Exception as refresh_error:
+            logger.warning(f"Account token metadata initialization failed for {credentials.email}: {refresh_error}")
 
         return AccountResponse(
             email_id=credentials.email,
@@ -1744,7 +2665,7 @@ async def register_account(credentials: AccountCredentials):
 @app.get("/emails/{email_id}", response_model=EmailListResponse)
 async def get_emails(
     email_id: str,
-    folder: str = Query("all", regex="^(inbox|junk|all)$"),
+    folder: str = Query("all", pattern="^(inbox|junk|all)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
     refresh: bool = Query(False, description="强制刷新缓存")
@@ -1800,6 +2721,23 @@ async def update_account_tags(email_id: str, request: UpdateTagsRequest):
         logger.error(f"Error updating account tags: {e}")
         raise HTTPException(status_code=500, detail="Failed to update account tags")
 
+
+@app.post("/accounts/{email_id}/refresh-token", response_model=TokenRefreshAccountResponse)
+async def refresh_single_account_token(email_id: str):
+    """刷新单个账户RT/AT。"""
+    try:
+        normalized_email = normalize_email(email_id)
+        return await refresh_account_tokens_by_email(
+            email_id=normalized_email,
+            extend_refresh_expires_at=True
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error refreshing token for {email_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refresh account token")
+
+
 @app.get("/emails/{email_id}/{message_id}", response_model=EmailDetailsResponse)
 async def get_email_detail(email_id: str, message_id: str):
     """获取邮件详细内容"""
@@ -1821,6 +2759,8 @@ async def delete_account(email_id: str):
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
 
+        clear_cached_access_token(normalized_email, "imap")
+        clear_cached_access_token(normalized_email, "graph")
         return AccountResponse(
             email_id=normalized_email,
             message="Account deleted successfully."
@@ -1828,7 +2768,7 @@ async def delete_account(email_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting account from sqlite: {e}")
+        logger.error(f"Error deleting account from PostgreSQL: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete account")
 
 
@@ -1867,7 +2807,7 @@ async def get_web_account_credentials(credential_path: str) -> AccountCredential
 @app.get("/web/{credential_path}", response_class=HTMLResponse)
 async def web_mailbox(
     credential_path: str,
-    folder: str = Query("all", regex="^(inbox|junk|all)$"),
+    folder: str = Query("all", pattern="^(inbox|junk|all)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     refresh: bool = Query(False)
@@ -2107,6 +3047,10 @@ async def api_status():
         "endpoints": {
             "get_accounts": "GET /accounts",
             "register_account": "POST /accounts",
+            "get_token_refresh_settings": "GET /token-refresh/settings",
+            "update_token_refresh_settings": "PUT /token-refresh/settings",
+            "refresh_all_tokens": "POST /token-refresh/refresh-all",
+            "refresh_single_account_token": "POST /accounts/{email_id}/refresh-token",
             "get_emails": "GET /emails/{email_id}?refresh=true",
             "get_dual_view_emails": "GET /emails/{email_id}/dual-view",
             "get_email_detail": "GET /emails/{email_id}/{message_id}",

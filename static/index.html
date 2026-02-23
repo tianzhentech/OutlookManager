@@ -97,6 +97,32 @@
                                 </button>
                             </div>
                         </div>
+
+                        <div class="token-refresh-toolbar mb-4">
+                            <label class="token-refresh-check">
+                                <input type="checkbox" id="tokenRefreshEnabled">
+                                启用定时刷新RT
+                            </label>
+                            <div class="token-refresh-interval">
+                                <span>每</span>
+                                <input type="number" id="tokenRefreshInterval" min="1" step="1" value="12">
+                                <select id="tokenRefreshUnit" class="form-control token-refresh-unit">
+                                    <option value="minute">分钟</option>
+                                    <option value="hour" selected>小时</option>
+                                    <option value="day">天</option>
+                                </select>
+                                <span>刷新一次</span>
+                            </div>
+                            <button class="btn btn-secondary btn-sm" id="saveTokenRefreshSettingsBtn" onclick="saveTokenRefreshSettings()">
+                                <span>💾</span>
+                                保存定时设置
+                            </button>
+                            <button class="btn btn-primary btn-sm" id="refreshAllTokensBtn" onclick="refreshAllAccountTokens()">
+                                <span>🔁</span>
+                                全部刷新RT
+                            </button>
+                            <span class="token-refresh-hint" id="tokenRefreshScheduleInfo">定时刷新未配置</span>
+                        </div>
                         
                         <!-- 统计信息 -->
                         <div id="accountsStats" class="mb-4" style="display: none;">
