@@ -17,10 +17,10 @@
     --shadow-lg: 0 26px 56px rgba(17, 46, 76, 0.15);
     --shadow-md: 0 12px 28px rgba(18, 52, 83, 0.12);
     --shadow-sm: 0 8px 20px rgba(18, 52, 83, 0.08);
-    --radius-xl: 24px;
-    --radius-lg: 16px;
-    --radius-md: 12px;
-    --radius-sm: 10px;
+    --radius-xl: 0;
+    --radius-lg: 0;
+    --radius-md: 0;
+    --radius-sm: 0;
 }
 
 * {
@@ -72,9 +72,9 @@ body::after {
 
 .app-container {
     display: flex;
-    height: calc(100vh - 28px);
-    margin: 14px;
-    border-radius: 28px;
+    height: 100vh;
+    margin: 0;
+    border-radius: 0;
     overflow: hidden;
     border: 1px solid rgba(184, 209, 229, 0.76);
     box-shadow: var(--shadow-lg);
@@ -298,10 +298,40 @@ body::after {
 
 .main-body {
     flex: 1;
-    padding: 12px 22px 22px;
+    padding: 0;
     overflow-y: auto;
     overflow-x: hidden;
     background: transparent;
+}
+
+.main-body.accounts-page-active {
+    overflow: hidden;
+    padding-top: 0;
+}
+
+.main-body.accounts-page-active #accountsPage {
+    height: 100%;
+}
+
+.main-body.accounts-page-active #accountsPage .card {
+    height: 100%;
+    margin-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.main-body.accounts-page-active #accountsList {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    align-content: start;
+    padding-right: 0;
+}
+
+.main-body.accounts-page-active #accountsPagination {
+    margin-top: 0;
 }
 
 .page {
@@ -321,7 +351,7 @@ body::after {
 
 .card {
     padding: 22px;
-    margin-bottom: 24px;
+    margin-bottom: 0;
 }
 
 .form-group {
@@ -1530,6 +1560,53 @@ code {
     display: none !important;
 }
 
+/* 平面矩形风格：统一去圆角 */
+.app-container,
+.sidebar,
+.main-header,
+.card,
+.api-endpoint,
+.modal-content,
+.modal-header,
+.modal-footer,
+.btn,
+.form-control,
+.form-input,
+.search-input,
+.filter-select,
+.account-item,
+.email-item,
+.opened-account-item,
+.opened-account-close,
+.opened-account-count,
+.opened-account-dot,
+.account-avatar,
+.email-avatar,
+.account-tag,
+.tag-item,
+.token-refresh-toolbar,
+.token-refresh-interval input,
+.token-refresh-interval .token-refresh-unit,
+.tab,
+.content-tab,
+.page-number,
+.context-menu,
+.notification,
+.progress-bar,
+.api-params,
+.api-param-type,
+.api-method,
+.api-example,
+.api-try-button,
+.form-section,
+code,
+.email-content-body,
+.email-child-window-panel,
+.email-child-window-badge,
+.email-copyable {
+    border-radius: 0 !important;
+}
+
 body.embed-mode {
     overflow: auto;
     background: #f2f8fd;
@@ -1562,7 +1639,7 @@ body.embed-mode .main-content {
 }
 
 body.embed-mode .main-body {
-    padding: 12px;
+    padding: 0;
     overflow: visible;
 }
 
@@ -1663,9 +1740,9 @@ body.embed-mode #backToAccountsBtn {
 
     .app-container {
         height: auto;
-        min-height: calc(100vh - 20px);
-        margin: 10px;
-        border-radius: 20px;
+        min-height: 100vh;
+        margin: 0;
+        border-radius: 0;
         flex-direction: column;
     }
 
@@ -1709,12 +1786,16 @@ body.embed-mode #backToAccountsBtn {
     }
 
     .main-body {
-        padding: 10px 14px 14px;
+        padding: 0;
+    }
+
+    .main-body.accounts-page-active {
+        padding-top: 0;
     }
 
     .card {
         padding: 16px;
-        margin-bottom: 16px;
+        margin-bottom: 0;
     }
 
     .modal {
@@ -1799,7 +1880,11 @@ body.embed-mode #backToAccountsBtn {
     }
 
     .main-body {
-        padding: 8px 10px 10px;
+        padding: 0;
+    }
+
+    .main-body.accounts-page-active {
+        padding-top: 0;
     }
 
     .btn,

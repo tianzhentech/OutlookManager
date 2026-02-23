@@ -1,5 +1,10 @@
 // 页面管理
 function showPage(pageName, targetElement = null) {
+    const mainBody = document.querySelector('.main-body');
+    if (mainBody) {
+        mainBody.classList.toggle('accounts-page-active', pageName === 'accounts');
+    }
+
     // 隐藏所有页面
     document.querySelectorAll('.page').forEach(page => page.classList.add('hidden'));
 
