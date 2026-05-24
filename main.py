@@ -2407,6 +2407,7 @@ async def list_emails_imap(
                         if not match:
                             continue
                         fetched_msg_id = match.group(1)
+                        is_read = b'\\Seen' in msg_data[i][0]
 
                         msg = email.message_from_bytes(header_data)
                         subject = decode_header_value(msg.get('Subject', '(No Subject)'))
@@ -2432,7 +2433,7 @@ async def list_emails_imap(
                                 subject=subject,
                                 from_email=from_email,
                                 date=formatted_date,
-                                is_read=False,
+                                is_read=is_read,
                                 has_attachments=False,
                                 sender_initial=sender_initial
                             )
@@ -2637,6 +2638,11 @@ async def get_email_details_imap(credentials: AccountCredentials, message_id: st
                 formatted_date = datetime.now().isoformat()
 
             body_plain, body_html = extract_email_content(msg)
+            try:
+                imap_client.store(msg_id, '+FLAGS', '\\Seen')
+                clear_email_cache(str(credentials.email))
+            except Exception as e:
+                logger.warning(f"Failed to mark IMAP email as read for {credentials.email}: {e}")
             imap_pool.return_connection(credentials.email, imap_client)
 
             return EmailDetailsResponse(

@@ -99,7 +99,7 @@ function filterEmails(emails, search) {
   });
 }
 
-function WebMailboxDetailDrawer({ credentialPath, messageId, open, onClose }) {
+function WebMailboxDetailDrawer({ credentialPath, messageId, open, onClose, onRead }) {
   const { message } = App.useApp();
   const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -112,10 +112,13 @@ function WebMailboxDetailDrawer({ credentialPath, messageId, open, onClose }) {
     apiRequest(`/web/${encodeURIComponent(credentialPath)}/message/${encodeURIComponent(messageId)}`, {
       redirectOnUnauthorized: false,
     })
-      .then(setDetail)
+      .then((data) => {
+        setDetail(data);
+        onRead?.(messageId);
+      })
       .catch((error) => message.error(`加载邮件详情失败：${error.message}`))
       .finally(() => setLoading(false));
-  }, [credentialPath, messageId, open, message]);
+  }, [credentialPath, messageId, open, message, onRead]);
 
   return (
     <Drawer
@@ -291,6 +294,12 @@ export function WebMailboxApp() {
   }, [credentialPath, folder, pageSize]);
 
   const filteredEmails = useMemo(() => filterEmails(emails, search), [emails, search]);
+
+  const markEmailRead = useCallback((messageId) => {
+    setEmails((items) =>
+      items.map((email) => (email.message_id === messageId ? { ...email, is_read: true } : email)),
+    );
+  }, []);
 
   const openDetail = (messageId) => {
     setDetailMessageId(messageId);
@@ -474,6 +483,7 @@ export function WebMailboxApp() {
           messageId={detailMessageId}
           open={Boolean(detailMessageId)}
           onClose={closeDetail}
+          onRead={markEmailRead}
         />
       </PageContainer>
     </ProLayout>

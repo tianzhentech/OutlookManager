@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ClearOutlined,
   DownloadOutlined,
@@ -50,7 +50,7 @@ function filterEmails(emails, filters) {
   });
 }
 
-function EmailDetailDrawer({ account, messageId, open, onClose }) {
+function EmailDetailDrawer({ account, messageId, open, onClose, onRead }) {
   const { message } = App.useApp();
   const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -60,10 +60,13 @@ function EmailDetailDrawer({ account, messageId, open, onClose }) {
     setDetail(null);
     setLoading(true);
     apiRequest(`/emails/${encodeURIComponent(account)}/${encodeURIComponent(messageId)}`)
-      .then(setDetail)
+      .then((data) => {
+        setDetail(data);
+        onRead?.(messageId);
+      })
       .catch((error) => message.error(`加载邮件详情失败：${error.message}`))
       .finally(() => setLoading(false));
-  }, [open, account, messageId]);
+  }, [open, account, messageId, onRead]);
 
   return (
     <Drawer width="min(980px, 92vw)" open={open} title={detail?.subject || '邮件详情'} onClose={onClose}>
@@ -163,6 +166,11 @@ export function EmailsPage({ emailId, onPickAccount }) {
   }, [emailId, folder]);
 
   const filteredEmails = useMemo(() => filterEmails(emails, filters), [emails, filters]);
+  const markEmailRead = useCallback((messageId) => {
+    setEmails((items) =>
+      items.map((email) => (email.message_id === messageId ? { ...email, is_read: true } : email)),
+    );
+  }, []);
   const stats = useMemo(
     () => ({
       total: emails.length,
@@ -348,6 +356,7 @@ export function EmailsPage({ emailId, onPickAccount }) {
         messageId={detailMessageId}
         open={Boolean(detailMessageId)}
         onClose={() => setDetailMessageId('')}
+        onRead={markEmailRead}
       />
     </Space>
   );
