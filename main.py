@@ -809,6 +809,23 @@ def normalize_email(email_id: str) -> str:
     return email_id.strip().lower()
 
 
+def normalize_web_lookup_email(email_id: str) -> str:
+    """
+    Web快速取件邮箱匹配规则。
+
+    Outlook 支持 plus addressing，例如 user+tag@outlook.com 会投递到 user@outlook.com。
+    /web 登录和直连路径按主邮箱查找后台已保存账户。
+    """
+    normalized = normalize_email(email_id)
+    local_part, separator, domain = normalized.partition("@")
+    if not separator:
+        return normalized
+
+    if domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"} and "+" in local_part:
+        local_part = local_part.split("+", 1)[0]
+    return f"{local_part}@{domain}"
+
+
 def parse_tags(tags_raw: Optional[str]) -> List[str]:
     if not tags_raw:
         return []
@@ -1490,7 +1507,7 @@ def get_account_credentials_by_email_and_password(
     mailbox_password: str
 ) -> Optional[AccountCredentials]:
     """按邮箱+邮箱密码查询账户（用于 /web 路由）"""
-    normalized_email = normalize_email(email_id)
+    normalized_email = normalize_web_lookup_email(email_id)
     normalized_password = mailbox_password.strip()
 
     if not normalized_email or not normalized_password:
@@ -3098,9 +3115,10 @@ async def get_web_account_credentials(credential_path: str) -> AccountCredential
     email_id, mailbox_password = parse_web_credential_path(credential_path)
     credentials = get_account_credentials_by_email_and_password(email_id, mailbox_password)
     if not credentials:
+        lookup_email = normalize_web_lookup_email(email_id)
         raise HTTPException(
             status_code=404,
-            detail=f"Account not found in database for {email_id}"
+            detail=f"Account not found in database for {lookup_email}"
         )
     return credentials
 
@@ -3385,9 +3403,25 @@ async def root():
     const form = document.getElementById("webLoginForm");
     const tip = document.getElementById("tip");
 
+    function normalizeWebLookupEmail(value) {
+      const normalized = String(value || "").trim().toLowerCase();
+      const parts = normalized.split("@");
+      if (parts.length !== 2) {
+        return normalized;
+      }
+
+      const outlookDomains = new Set(["outlook.com", "hotmail.com", "live.com", "msn.com"]);
+      let localPart = parts[0];
+      const domain = parts[1];
+      if (outlookDomains.has(domain) && localPart.includes("+")) {
+        localPart = localPart.split("+")[0];
+      }
+      return `${localPart}@${domain}`;
+    }
+
     form.addEventListener("submit", function (e) {
       e.preventDefault();
-      const email = document.getElementById("email").value.trim();
+      const email = normalizeWebLookupEmail(document.getElementById("email").value);
       const password = document.getElementById("password").value.trim();
       if (!email || !password) {
         return;
