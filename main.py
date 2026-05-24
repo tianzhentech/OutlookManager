@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import socket
+import sqlite3
 import threading
 import time
 import hashlib
@@ -25,9 +26,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
 from itertools import groupby
+from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 import psycopg
@@ -48,8 +50,8 @@ from psycopg.rows import dict_row
 # ============================================================================
 
 # 数据库和缓存配置
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://outlook:outlook@postgres:5432/outlook_manager").strip()
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/outlook-manager.db").strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
 REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "outlook-manager").strip() or "outlook-manager"
 REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "3"))
 
@@ -71,7 +73,12 @@ ADMIN_COOKIE_SECURE = os.getenv("ADMIN_COOKIE_SECURE", "false").strip().lower() 
 ADMIN_ACCESS_COOKIE_NAME = "admin_access_token"
 ADMIN_REFRESH_COOKIE_NAME = "admin_refresh_token"
 ADMIN_PROTECTED_API_PREFIXES = ("/accounts", "/emails", "/cache", "/token-refresh")
-ADMIN_PROTECTED_HTML_PATHS = {"/admin/panel", "/admin/panel/", "/static/index.html"}
+ADMIN_PROTECTED_HTML_PATHS = {
+    "/admin/panel",
+    "/admin/panel/",
+    "/static/index.html",
+    "/static/admin/index.html",
+}
 ADMIN_PROTECTED_EXACT_PATHS = {"/api", *ADMIN_PROTECTED_HTML_PATHS}
 
 # 账户令牌配置
@@ -100,12 +107,6 @@ SOCKET_TIMEOUT = 15
 # 缓存配置
 CACHE_EXPIRE_TIME = 60  # 缓存过期时间（秒）
 WEB_MAILBOX_SSE_POLL_SECONDS = int(os.getenv("WEB_MAILBOX_SSE_POLL_SECONDS", "5"))
-
-# 临时邮箱 API（GPTMail）配置
-TEMP_MAIL_API_BASE_URL = os.getenv("TEMP_MAIL_API_BASE_URL", "https://mail.chatgpt.org.uk").strip().rstrip("/")
-TEMP_MAIL_API_KEY = os.getenv("TEMP_MAIL_API_KEY", "gpt-test").strip()
-TEMP_MAIL_API_TIMEOUT_SECONDS = float(os.getenv("TEMP_MAIL_API_TIMEOUT_SECONDS", "12"))
-TEMP_MAIL_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # 日志配置
 logging.basicConfig(
@@ -190,6 +191,12 @@ class EmailListResponse(BaseModel):
     page_size: int
     total_emails: int
     emails: List[EmailItem]
+
+
+class WebMailboxListResponse(EmailListResponse):
+    """Web收件页邮件列表响应模型"""
+    source_type: str = "outlook"
+    auth_mode: str = "imap"
 
 
 class DualViewEmailResponse(BaseModel):
@@ -479,8 +486,51 @@ email_cache = {}  # 邮件列表缓存
 email_count_cache = {}  # 邮件总数缓存，用于检测新邮件
 
 
+class SQLiteConnection:
+    """SQLite连接包装器，用于本地调试。"""
+
+    backend = "sqlite"
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._conn = sqlite3.connect(db_path, timeout=30)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA busy_timeout = 30000")
+        if db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode = WAL")
+
+    def execute(self, sql: str, params: Optional[List[Any] | Tuple[Any, ...]] = None):
+        if params is None:
+            return self._conn.execute(sql)
+        return self._conn.execute(sql, tuple(params))
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._conn.close()
+        return False
+
+
 class PostgresConnection:
-    """简化版PostgreSQL连接包装器，尽量保持原有调用风格。"""
+    """PostgreSQL连接包装器，尽量保持原有调用风格。"""
+
+    backend = "postgresql"
 
     def __init__(self, dsn: str):
         self._conn = psycopg.connect(dsn, row_factory=dict_row)
@@ -518,8 +568,33 @@ class PostgresConnection:
         return False
 
 
-def get_db_connection() -> PostgresConnection:
-    """获取PostgreSQL连接。"""
+def is_sqlite_database_url(database_url: str) -> bool:
+    return database_url.startswith("sqlite:")
+
+
+def sqlite_path_from_url(database_url: str) -> str:
+    """解析文件型 SQLite URL，例如 sqlite:///./data/outlook-manager.db。"""
+    prefix = "sqlite:///"
+    if database_url.startswith(prefix):
+        raw_path = database_url[len(prefix):]
+    elif database_url.startswith("sqlite://"):
+        raw_path = database_url[len("sqlite://"):]
+    else:
+        raise ValueError(f"Unsupported SQLite DATABASE_URL: {database_url}")
+
+    db_path = unquote(raw_path.split("?", 1)[0])
+    if not db_path or db_path == ":memory:":
+        raise ValueError("Use a file-based SQLite DATABASE_URL, for example sqlite:///./data/outlook-manager.db")
+
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def get_db_connection() -> SQLiteConnection | PostgresConnection:
+    """获取数据库连接，支持本地SQLite和生产PostgreSQL。"""
+    if is_sqlite_database_url(DATABASE_URL):
+        return SQLiteConnection(sqlite_path_from_url(DATABASE_URL))
     return PostgresConnection(DATABASE_URL)
 
 
@@ -810,8 +885,24 @@ def resolve_account_status(
     return "active"
 
 
-def ensure_table_column(conn: PostgresConnection, table_name: str, column_name: str, column_sql: str) -> None:
-    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {column_sql}")
+def quote_identifier(identifier: str) -> str:
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", identifier):
+        raise ValueError(f"Invalid SQL identifier: {identifier}")
+    return f'"{identifier}"'
+
+
+def ensure_table_column(conn: SQLiteConnection | PostgresConnection, table_name: str, column_name: str, column_sql: str) -> None:
+    table_identifier = quote_identifier(table_name)
+    column_identifier = quote_identifier(column_name)
+
+    if conn.backend == "sqlite":
+        existing_columns = conn.execute(f"PRAGMA table_info({table_identifier})").fetchall()
+        if any(row["name"] == column_name for row in existing_columns):
+            return
+        conn.execute(f"ALTER TABLE {table_identifier} ADD COLUMN {column_identifier} {column_sql}")
+        return
+
+    conn.execute(f"ALTER TABLE {table_identifier} ADD COLUMN IF NOT EXISTS {column_identifier} {column_sql}")
 
 
 def build_access_token_cache_key(email_id: str, auth_mode: str) -> str:
@@ -1039,11 +1130,11 @@ def init_account_db() -> None:
             )
             conn.commit()
     except Exception as e:
-        logger.error(f"Failed to initialize PostgreSQL schema: {e}")
+        logger.error(f"Failed to initialize database schema: {e}")
         raise
 
 
-def get_token_refresh_settings_row(conn: PostgresConnection) -> Dict[str, Any]:
+def get_token_refresh_settings_row(conn: SQLiteConnection | PostgresConnection) -> Dict[str, Any]:
     row = conn.execute(
         """
         SELECT enabled, interval_value, interval_unit, next_run_at, last_run_at
@@ -1307,7 +1398,14 @@ def render_admin_login_page(error_message: Optional[str] = None) -> str:
     """管理员登录页"""
     error_html = ""
     if error_message:
-        error_html = f'<div class="auth-error">{escape(error_message)}</div>'
+        error_html = f"""
+        <div class="ant-alert ant-alert-error auth-error" role="alert">
+          <span class="ant-alert-icon">!</span>
+          <div class="ant-alert-content">
+            <div class="ant-alert-message">{escape(error_message)}</div>
+          </div>
+        </div>
+        """
 
     return f"""
 <!DOCTYPE html>
@@ -1322,16 +1420,53 @@ def render_admin_login_page(error_message: Optional[str] = None) -> str:
   <link rel="stylesheet" href="/static/auth-pages.css" />
 </head>
 <body class="auth-page auth-page-admin">
-  <div class="auth-card">
-    <div class="auth-chip"><span class="auth-dot"></span>Outlook Manager Console</div>
-    <h2>后台管理登录</h2>
-    <p>请输入管理员密码。</p>
-    {error_html}
-    <form class="auth-form" method="post" action="/admin/auth/login">
-      <label for="password">管理员密码</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required />
-      <button type="submit">登录后台</button>
-    </form>
+  <div class="auth-layout-shell">
+    <aside class="auth-aside">
+      <div class="auth-brand">
+        <span class="auth-logo">OM</span>
+        <span>Outlook Manager</span>
+      </div>
+      <h1>邮箱管理控制台</h1>
+      <p>统一管理 Outlook 账户、令牌刷新、邮件查询和接口调试。</p>
+      <div class="auth-metrics">
+        <div>
+          <strong>IMAP</strong>
+          <span>连接池</span>
+        </div>
+        <div>
+          <strong>Graph</strong>
+          <span>API 模式</span>
+        </div>
+        <div>
+          <strong>RT</strong>
+          <span>定时刷新</span>
+        </div>
+      </div>
+    </aside>
+    <main class="auth-main">
+      <div class="ant-card auth-card">
+        <div class="ant-card-body">
+          <div class="auth-card-header">
+            <span class="auth-card-icon">↗</span>
+            <div>
+              <h2>后台登录</h2>
+              <p>输入管理员密码进入控制台。</p>
+            </div>
+          </div>
+          {error_html}
+          <form class="auth-form" method="post" action="/admin/auth/login">
+            <label class="ant-form-item-required" for="password">管理员密码</label>
+            <div class="ant-input-affix-wrapper">
+              <span class="ant-input-prefix">🔒</span>
+              <input id="password" name="password" type="password" autocomplete="current-password" required autofocus placeholder="请输入管理员密码" />
+            </div>
+            <button class="ant-btn ant-btn-primary auth-submit" type="submit">
+              <span>登录后台</span>
+            </button>
+          </form>
+        </div>
+      </div>
+    </main>
   </div>
 </body>
 </html>
@@ -1373,7 +1508,7 @@ def get_account_credentials_by_email_and_password(
                 (normalized_email, normalized_password)
             ).fetchone()
     except Exception as e:
-        logger.error(f"Failed to query account by email/password from PostgreSQL: {e}")
+        logger.error(f"Failed to query account by email/password from database: {e}")
         return None
 
     if not row:
@@ -1556,7 +1691,7 @@ def extract_email_content(email_message: email.message.EmailMessage) -> tuple[st
 
 async def get_account_credentials(email_id: str) -> AccountCredentials:
     """
-    从PostgreSQL获取指定邮箱的账户凭证
+    从数据库获取指定邮箱的账户凭证
 
     Args:
         email_id: 邮箱地址
@@ -1584,7 +1719,7 @@ async def get_account_credentials(email_id: str) -> AccountCredentials:
             ).fetchone()
 
         if not row:
-            logger.warning(f"Account {normalized_email} not found in PostgreSQL")
+            logger.warning(f"Account {normalized_email} not found in database")
             raise HTTPException(status_code=404, detail=f"Account {normalized_email} not found")
 
         return row_to_credentials(row)
@@ -1592,12 +1727,12 @@ async def get_account_credentials(email_id: str) -> AccountCredentials:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error getting account credentials for {email_id} from PostgreSQL: {e}")
+        logger.error(f"Unexpected error getting account credentials for {email_id} from database: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
 async def save_account_credentials(email_id: str, credentials: AccountCredentials) -> None:
-    """保存账户凭证到PostgreSQL"""
+    """保存账户凭证到数据库"""
     try:
         normalized_email = normalize_email(email_id)
         if not normalized_email:
@@ -1680,9 +1815,9 @@ async def save_account_credentials(email_id: str, credentials: AccountCredential
         # 凭证被修改后，清理旧AT缓存，避免继续使用过时token
         clear_cached_access_token(normalized_email, "imap")
         clear_cached_access_token(normalized_email, "graph")
-        logger.info(f"Account credentials saved to PostgreSQL for {normalized_email}")
+        logger.info(f"Account credentials saved to database for {normalized_email}")
     except Exception as e:
-        logger.error(f"Error saving account credentials to PostgreSQL: {e}")
+        logger.error(f"Error saving account credentials to database: {e}")
         raise HTTPException(status_code=500, detail="Failed to save account")
 
 
@@ -1760,7 +1895,7 @@ async def get_all_accounts(
         )
 
     except Exception as e:
-        logger.error(f"Error getting accounts list from PostgreSQL: {e}")
+        logger.error(f"Error getting accounts list from database: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -1783,7 +1918,7 @@ async def get_account_detail(email_id: str) -> AccountDetailResponse:
                 (normalized_email,)
             ).fetchone()
     except Exception as e:
-        logger.error(f"Failed to get account detail from PostgreSQL for {normalized_email}: {e}")
+        logger.error(f"Failed to get account detail from database for {normalized_email}: {e}")
         raise HTTPException(status_code=500, detail="Failed to get account detail")
 
     if not row:
@@ -2585,215 +2720,6 @@ async def get_email_details(credentials: AccountCredentials, message_id: str) ->
     return await get_email_details_imap(credentials, message_id)
 
 
-def parse_temp_mail_datetime(timestamp_value: Any, created_at_value: Any) -> str:
-    """将临时邮箱API时间字段标准化为ISO字符串。"""
-    if isinstance(timestamp_value, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(timestamp_value), tz=timezone.utc).isoformat()
-        except Exception:
-            pass
-
-    if isinstance(timestamp_value, str) and timestamp_value.strip():
-        try:
-            return datetime.fromtimestamp(float(timestamp_value.strip()), tz=timezone.utc).isoformat()
-        except Exception:
-            pass
-
-    if isinstance(created_at_value, str) and created_at_value.strip():
-        raw_value = created_at_value.strip()
-        try:
-            return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).isoformat()
-        except Exception:
-            return raw_value
-
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_temp_mail_sort_timestamp(timestamp_value: Any, created_at_value: Any) -> float:
-    """提取临时邮箱邮件排序时间戳。"""
-    if isinstance(timestamp_value, (int, float)):
-        return float(timestamp_value)
-
-    if isinstance(timestamp_value, str) and timestamp_value.strip():
-        try:
-            return float(timestamp_value.strip())
-        except Exception:
-            pass
-
-    if isinstance(created_at_value, str) and created_at_value.strip():
-        try:
-            return datetime.fromisoformat(created_at_value.strip().replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return 0.0
-
-    return 0.0
-
-
-def parse_temp_mail_api_error(payload: Any, fallback: str = "Unknown error") -> str:
-    """解析临时邮箱API返回错误信息。"""
-    if isinstance(payload, dict):
-        raw_error = payload.get("error")
-        if isinstance(raw_error, str) and raw_error.strip():
-            return raw_error.strip()
-    return fallback
-
-
-async def request_temp_mail_api(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """请求 GPTMail 临时邮箱 API。"""
-    if not TEMP_MAIL_API_BASE_URL:
-        raise HTTPException(status_code=500, detail="Temporary mailbox API base URL is not configured")
-
-    request_url = f"{TEMP_MAIL_API_BASE_URL}{path}"
-    headers = {"Accept": "application/json"}
-    if TEMP_MAIL_API_KEY:
-        headers["X-API-Key"] = TEMP_MAIL_API_KEY
-
-    try:
-        async with httpx.AsyncClient(timeout=TEMP_MAIL_API_TIMEOUT_SECONDS) as client:
-            response = await client.get(request_url, headers=headers, params=params)
-    except httpx.RequestError as e:
-        logger.error(f"Temporary mailbox API request error: {e}")
-        raise HTTPException(status_code=502, detail="Failed to connect to temporary mailbox API")
-
-    try:
-        payload = response.json()
-    except ValueError:
-        logger.error(f"Temporary mailbox API returned invalid JSON: {response.text[:500]}")
-        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid JSON")
-
-    if response.status_code >= 400:
-        error_detail = parse_temp_mail_api_error(payload, response.reason_phrase or "HTTP error")
-        mapped_status = response.status_code if response.status_code in {400, 401, 403, 404, 429} else 502
-        raise HTTPException(
-            status_code=mapped_status,
-            detail=f"Temporary mailbox API request failed: {error_detail}"
-        )
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid payload")
-
-    if payload.get("success") is False:
-        error_detail = parse_temp_mail_api_error(payload, "API returned success=false")
-        raise HTTPException(status_code=502, detail=f"Temporary mailbox API request failed: {error_detail}")
-
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid data field")
-
-    return data
-
-
-async def list_emails_temp_mail(
-    temp_email: str,
-    folder: str,
-    page: int,
-    page_size: int,
-    force_refresh: bool = False
-) -> EmailListResponse:
-    """从临时邮箱API获取邮件列表。"""
-    normalized_email = normalize_email(temp_email)
-    cache_key = get_cache_key(normalized_email, "temp-mail", folder, page, page_size)
-    cached_result = get_cached_emails(cache_key, force_refresh)
-    if cached_result:
-        return cached_result
-
-    if folder == "junk":
-        empty_result = EmailListResponse(
-            email_id=normalized_email,
-            folder_view=folder,
-            page=page,
-            page_size=page_size,
-            total_emails=0,
-            emails=[]
-        )
-        set_cached_emails(cache_key, empty_result)
-        return empty_result
-
-    data = await request_temp_mail_api("/api/emails", params={"email": normalized_email})
-    raw_emails = data.get("emails")
-    if not isinstance(raw_emails, list):
-        raise HTTPException(status_code=502, detail="Temporary mailbox API returned invalid emails format")
-
-    sortable_items: List[Tuple[float, EmailItem]] = []
-    for raw_item in raw_emails:
-        if not isinstance(raw_item, dict):
-            continue
-
-        message_id = str(raw_item.get("id") or "").strip()
-        if not message_id:
-            continue
-
-        from_email = str(raw_item.get("from_address") or "")
-        sender_initial = "?"
-        sender_match = re.search(r"([a-zA-Z])", from_email)
-        if sender_match:
-            sender_initial = sender_match.group(1).upper()
-
-        timestamp_value = raw_item.get("timestamp")
-        created_at_value = raw_item.get("created_at")
-        normalized_date = parse_temp_mail_datetime(timestamp_value, created_at_value)
-        sort_ts = parse_temp_mail_sort_timestamp(timestamp_value, created_at_value)
-
-        sortable_items.append(
-            (
-                sort_ts,
-                EmailItem(
-                    message_id=message_id,
-                    folder="INBOX",
-                    subject=str(raw_item.get("subject") or "(No Subject)"),
-                    from_email=from_email,
-                    date=normalized_date,
-                    is_read=bool(raw_item.get("is_read", False)),
-                    has_attachments=bool(raw_item.get("has_attachments", False)),
-                    sender_initial=sender_initial
-                )
-            )
-        )
-
-    sortable_items.sort(key=lambda item: item[0], reverse=True)
-    all_items = [item for _, item in sortable_items]
-
-    start_index = (page - 1) * page_size
-    end_index = start_index + page_size
-    paged_items = all_items[start_index:end_index]
-
-    result = EmailListResponse(
-        email_id=normalized_email,
-        folder_view=folder,
-        page=page,
-        page_size=page_size,
-        total_emails=len(all_items),
-        emails=paged_items
-    )
-    set_cached_emails(cache_key, result)
-    return result
-
-
-async def get_email_details_temp_mail(message_id: str) -> EmailDetailsResponse:
-    """从临时邮箱API获取单封邮件详情。"""
-    normalized_message_id = str(message_id or "").strip()
-    if not normalized_message_id:
-        raise HTTPException(status_code=400, detail="Invalid temporary mailbox message_id")
-
-    data = await request_temp_mail_api(f"/api/email/{quote(normalized_message_id, safe='')}")
-
-    plain_content = data.get("content")
-    html_content = data.get("html_content")
-
-    body_plain = str(plain_content).strip() if plain_content is not None else ""
-    body_html = str(html_content).strip() if html_content is not None else ""
-
-    return EmailDetailsResponse(
-        message_id=str(data.get("id") or normalized_message_id),
-        subject=str(data.get("subject") or "(No Subject)"),
-        from_email=str(data.get("from_address") or "(Unknown Sender)"),
-        to_email=str(data.get("email_address") or "(Unknown Recipient)"),
-        date=parse_temp_mail_datetime(data.get("timestamp"), data.get("created_at")),
-        body_plain=body_plain or None,
-        body_html=body_html or None
-    )
-
-
 async def run_refresh_all_accounts_with_lock(extend_refresh_expires_at: bool = True) -> TokenRefreshAllResponse:
     global token_refresh_run_lock
     if token_refresh_run_lock is None:
@@ -2853,7 +2779,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     # 应用启动
     logger.info("Starting Outlook Email Management System...")
     init_account_db()
-    logger.info("PostgreSQL schema initialization completed")
+    logger.info("Database schema initialization completed")
     init_redis_cache_client()
     if ADMIN_PASSWORD == "change_me_admin_password":
         logger.warning("ADMIN_PASSWORD is using default value. Please set ADMIN_PASSWORD in environment.")
@@ -3143,7 +3069,7 @@ async def delete_account(email_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting account from PostgreSQL: {e}")
+        logger.error(f"Error deleting account from database: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete account")
 
 
@@ -3179,17 +3105,6 @@ async def get_web_account_credentials(credential_path: str) -> AccountCredential
     return credentials
 
 
-def parse_web_temp_email_path(credential_path: str) -> str:
-    """解析 /web/{temporary_email} 路径参数。"""
-    email_id = normalize_email(credential_path)
-    if not email_id or not TEMP_MAIL_EMAIL_PATTERN.match(email_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid web path format. Use /web/{email}----{mailbox_password} or /web/{temporary_email}"
-        )
-    return email_id
-
-
 async def resolve_web_mailbox_source(
     credential_path: str
 ) -> tuple[str, str, Optional[AccountCredentials], str]:
@@ -3197,9 +3112,9 @@ async def resolve_web_mailbox_source(
     解析 /web 路径来源。
 
     Returns:
-        source_type: outlook | temp
+        source_type: outlook
         mailbox_email: 邮箱地址
-        credentials: Outlook凭证（仅outlook来源时有值）
+        credentials: Outlook凭证
         normalized_path_for_links: 生成链接时使用的路径字符串
     """
     normalized_path = (credential_path or "").strip()
@@ -3209,12 +3124,8 @@ async def resolve_web_mailbox_source(
             detail="Invalid web path format. Credential path is required"
         )
 
-    if "----" in normalized_path:
-        credentials = await get_web_account_credentials(normalized_path)
-        return "outlook", str(credentials.email), credentials, normalized_path
-
-    temp_email = parse_web_temp_email_path(normalized_path)
-    return "temp", temp_email, None, temp_email
+    credentials = await get_web_account_credentials(normalized_path)
+    return "outlook", str(credentials.email), credentials, normalized_path
 
 
 async def fetch_web_mailbox_email_response(
@@ -3227,9 +3138,6 @@ async def fetch_web_mailbox_email_response(
     force_refresh: bool = False
 ) -> EmailListResponse:
     """按 /web 来源获取邮件列表。"""
-    if source_type == "temp":
-        return await list_emails_temp_mail(mailbox_email, folder, page, page_size, force_refresh)
-
     if not credentials:
         raise HTTPException(status_code=500, detail="Web mailbox credentials resolve failed")
 
@@ -3243,21 +3151,36 @@ def build_web_mailbox_signature(source_type: str, email_response: EmailListRespo
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
+def serve_react_frontend_index() -> FileResponse:
+    """返回React前端入口。"""
+    react_admin_index = "static/admin/index.html"
+    if Path(react_admin_index).exists():
+        return FileResponse(react_admin_index)
+    raise HTTPException(status_code=500, detail="React frontend build not found. Run npm run frontend:build first.")
+
+
 @app.get("/web/{credential_path}", response_class=HTMLResponse)
 async def web_mailbox(
+    credential_path: str
+):
+    """
+    Web快速查看邮箱React入口。
+    访问路径示例：
+    - /web/user@outlook.com----mailbox_password
+    """
+    return serve_react_frontend_index()
+
+
+@app.get("/web/{credential_path}/messages", response_model=WebMailboxListResponse)
+async def web_mailbox_messages(
     credential_path: str,
     folder: str = Query("all", pattern="^(inbox|junk|all)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     refresh: bool = Query(False)
 ):
-    """
-    Web快速查看邮箱。
-    访问路径示例：
-    - /web/user@outlook.com----mailbox_password
-    - /web/temporary@mail.chatgpt.org.uk
-    """
-    source_type, mailbox_email, credentials, path_for_links = await resolve_web_mailbox_source(credential_path)
+    """Web快速查看邮箱邮件列表数据。"""
+    source_type, mailbox_email, credentials, _ = await resolve_web_mailbox_source(credential_path)
     email_response = await fetch_web_mailbox_email_response(
         source_type=source_type,
         mailbox_email=mailbox_email,
@@ -3267,167 +3190,11 @@ async def web_mailbox(
         page_size=page_size,
         force_refresh=refresh
     )
-    source_chip = (
-        "来源：GPTMail 临时邮箱API"
-        if source_type == "temp"
-        else f"认证模式：{normalize_auth_mode(credentials.auth_mode if credentials else 'imap').upper()}"
+    return WebMailboxListResponse(
+        **email_response.model_dump(),
+        source_type=source_type,
+        auth_mode=normalize_auth_mode(credentials.auth_mode if credentials else "imap")
     )
-
-    encoded_credential = quote(path_for_links, safe="")
-    sse_url_js = json.dumps(
-        f"/web/{encoded_credential}/events?folder={folder}&page_size={page_size}",
-        ensure_ascii=False
-    )
-    tab_links = [
-        ("all", "全部"),
-        ("inbox", "收件箱"),
-        ("junk", "垃圾箱")
-    ]
-    tabs_html = "".join(
-        f'<a class="wm-tab{" active" if folder == tab_folder else ""}" '
-        f'href="/web/{encoded_credential}?folder={tab_folder}&page=1&page_size={page_size}">{tab_label}</a>'
-        for tab_folder, tab_label in tab_links
-    )
-
-    rows = []
-    for item in email_response.emails:
-        detail_url = f"/web/{encoded_credential}/detail/{quote(item.message_id, safe='')}"
-        rows.append(
-            "<tr>"
-            f"<td>{escape(item.folder)}</td>"
-            f"<td><a class='wm-subject-link' href='{detail_url}'>{escape(item.subject or '(无主题)')}</a></td>"
-            f"<td>{escape(item.from_email or '')}</td>"
-            f"<td>{escape(item.date or '')}</td>"
-            "</tr>"
-        )
-
-    rows_html = "".join(rows) if rows else "<tr><td colspan='4' class='wm-empty'>暂无邮件</td></tr>"
-    prev_page = page - 1 if page > 1 else 1
-    next_page = page + 1
-
-    html_content = f"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{escape(mailbox_email)} 邮件预览</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/web-mail-view.css" />
-</head>
-<body class="webmail-page">
-  <div class="wm-shell">
-    <div class="wm-topbar">
-      <h2 class="wm-title">邮箱：{escape(mailbox_email)}</h2>
-      <div class="wm-topbar-actions">
-        <button id="wmManualRefreshBtn" class="wm-pager-btn wm-refresh-btn" type="button">手动刷新</button>
-        <span id="wmRealtimeStatus" class="wm-chip">实时监听初始化中...</span>
-        <span class="wm-chip">{escape(source_chip)}</span>
-      </div>
-    </div>
-    <div class="wm-tabs">{tabs_html}</div>
-    <div class="wm-table-wrap">
-      <table class="wm-table">
-        <thead>
-          <tr>
-            <th>文件夹</th>
-            <th>主题</th>
-            <th>发件人</th>
-            <th>时间</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows_html}
-        </tbody>
-      </table>
-    </div>
-    <div class="wm-pager">
-      <a class="wm-pager-btn" href="/web/{encoded_credential}?folder={folder}&page={prev_page}&page_size={page_size}">上一页</a>
-      <a class="wm-pager-btn" href="/web/{encoded_credential}?folder={folder}&page={next_page}&page_size={page_size}">下一页</a>
-    </div>
-  </div>
-  <script>
-    (() => {{
-      const sseUrl = {sse_url_js};
-      const manualRefreshBtn = document.getElementById("wmManualRefreshBtn");
-      const realtimeStatus = document.getElementById("wmRealtimeStatus");
-      let eventSource = null;
-      let hasPendingNewMail = false;
-
-      const buildRefreshUrl = () => {{
-        const url = new URL(window.location.href);
-        url.searchParams.set("refresh", "true");
-        return url.toString();
-      }};
-
-      const refreshNow = () => {{
-        window.location.replace(buildRefreshUrl());
-      }};
-
-      const setRealtimeStatus = (text) => {{
-        if (realtimeStatus) {{
-          realtimeStatus.textContent = text;
-        }}
-      }};
-
-      if (manualRefreshBtn) {{
-        manualRefreshBtn.addEventListener("click", refreshNow);
-      }}
-
-      if (typeof EventSource === "undefined") {{
-        setRealtimeStatus("当前浏览器不支持实时推送");
-        return;
-      }}
-
-      const closeRealtime = () => {{
-        if (eventSource) {{
-          eventSource.close();
-          eventSource = null;
-        }}
-      }};
-
-      setRealtimeStatus("实时监听中...");
-      eventSource = new EventSource(sseUrl);
-
-      eventSource.addEventListener("ready", (event) => {{
-        try {{
-          const payload = JSON.parse(event.data || "{{}}");
-          const total = Number(payload.total_emails || 0);
-          if (!hasPendingNewMail) {{
-            setRealtimeStatus(`实时监听中（当前 ${{total}} 封）`);
-          }}
-        }} catch (_) {{
-          if (!hasPendingNewMail) {{
-            setRealtimeStatus("实时监听中...");
-          }}
-        }}
-      }});
-
-      eventSource.addEventListener("new_mail", () => {{
-        hasPendingNewMail = true;
-        setRealtimeStatus("检测到新邮件，点击“手动刷新”查看");
-        if (manualRefreshBtn) {{
-          manualRefreshBtn.classList.add("wm-refresh-pulse");
-          manualRefreshBtn.textContent = "刷新查看新邮件";
-        }}
-      }});
-
-      eventSource.addEventListener("error", () => {{
-        if (!hasPendingNewMail) {{
-          setRealtimeStatus("连接中断，正在重连...");
-        }}
-      }});
-
-      window.addEventListener("beforeunload", closeRealtime);
-      window.addEventListener("pagehide", closeRealtime);
-    }})();
-  </script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html_content)
 
 
 @app.get("/web/{credential_path}/events")
@@ -3529,55 +3296,19 @@ async def web_mailbox_events(
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 
+@app.get("/web/{credential_path}/message/{message_id:path}", response_model=EmailDetailsResponse)
+async def web_mailbox_message_detail(credential_path: str, message_id: str):
+    """Web快速查看邮件详情数据。"""
+    _, _, credentials, _ = await resolve_web_mailbox_source(credential_path)
+    if not credentials:
+        raise HTTPException(status_code=500, detail="Web mailbox credentials resolve failed")
+    return await get_email_details(credentials, message_id)
+
+
 @app.get("/web/{credential_path}/detail/{message_id:path}", response_class=HTMLResponse)
 async def web_mailbox_detail(credential_path: str, message_id: str):
-    """Web快速查看邮件详情。"""
-    source_type, _, credentials, path_for_links = await resolve_web_mailbox_source(credential_path)
-    if source_type == "temp":
-        detail = await get_email_details_temp_mail(message_id)
-    else:
-        if not credentials:
-            raise HTTPException(status_code=500, detail="Web mailbox credentials resolve failed")
-        detail = await get_email_details(credentials, message_id)
-    encoded_credential = quote(path_for_links, safe="")
-
-    body_section = ""
-    if detail.body_html:
-        body_section = f"<div class='wmd-html-content'>{detail.body_html}</div>"
-    else:
-        body_section = f"<pre class='wmd-plain'>{escape(detail.body_plain or '')}</pre>"
-
-    html_content = f"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{escape(detail.subject or '(无主题)')}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/web-mail-view.css" />
-</head>
-<body class="webmail-detail-page">
-  <div class="wmd-shell">
-    <div class="wmd-header">
-      <a class="wmd-back-link" href="/web/{encoded_credential}">返回邮件列表</a>
-      <h2 class="wmd-title">{escape(detail.subject or '(无主题)')}</h2>
-      <p class="wmd-meta">发件人：{escape(detail.from_email or '')}</p>
-      <p class="wmd-meta">收件人：{escape(detail.to_email or '')}</p>
-      <p class="wmd-meta">时间：{escape(detail.date or '')}</p>
-    </div>
-    <div class="wmd-content">
-      <div class="wmd-paper">
-        {body_section}
-      </div>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html_content)
+    """Web快速查看邮件详情React入口。"""
+    return serve_react_frontend_index()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3596,19 +3327,58 @@ async def root():
   <link rel="stylesheet" href="/static/auth-pages.css" />
 </head>
 <body class="auth-page auth-page-web">
-  <div class="auth-card">
-    <div class="auth-chip"><span class="auth-dot"></span>Inbox Quick View</div>
-    <h2>邮箱登录</h2>
-    <p>输入邮箱和邮箱密码，登录后将跳转到邮件网页查看页。</p>
-    <p class="auth-tip">临时邮箱可直接访问：/web/{临时邮箱地址}</p>
-    <form class="auth-form" id="webLoginForm">
-      <label for="email">邮箱地址</label>
-      <input id="email" type="email" required placeholder="example@outlook.com" />
-      <label for="password">邮箱密码</label>
-      <input id="password" type="text" required placeholder="邮箱密码" />
-      <button type="submit">登录并查看邮件</button>
-    </form>
-    <div class="auth-tip" id="tip">目标路径：/web/{邮箱----邮箱密码}</div>
+  <div class="auth-layout-shell">
+    <aside class="auth-aside auth-aside-web">
+      <div class="auth-brand">
+        <span class="auth-logo">IQ</span>
+        <span>Inbox Quick View</span>
+      </div>
+      <h1>邮箱快速查看</h1>
+      <p>输入已在后台添加的 Outlook 邮箱和邮箱密码后，直接进入网页邮件列表。也可以直接访问 /web/{邮箱----邮箱密码}。</p>
+      <div class="auth-metrics">
+        <div>
+          <strong>Inbox</strong>
+          <span>收件箱</span>
+        </div>
+        <div>
+          <strong>Junk</strong>
+          <span>垃圾箱</span>
+        </div>
+        <div>
+          <strong>SSE</strong>
+          <span>实时刷新</span>
+        </div>
+      </div>
+    </aside>
+    <main class="auth-main">
+      <div class="ant-card auth-card">
+        <div class="ant-card-body">
+          <div class="auth-card-header">
+            <span class="auth-card-icon">↘</span>
+            <div>
+              <h2>邮箱登录</h2>
+              <p>登录后将跳转到邮件网页查看页。</p>
+            </div>
+          </div>
+          <form class="auth-form" id="webLoginForm">
+            <label class="ant-form-item-required" for="email">邮箱地址</label>
+            <div class="ant-input-affix-wrapper">
+              <span class="ant-input-prefix">@</span>
+              <input id="email" type="email" required placeholder="example@outlook.com" autocomplete="email" />
+            </div>
+            <label class="ant-form-item-required" for="password">邮箱密码</label>
+            <div class="ant-input-affix-wrapper">
+              <span class="ant-input-prefix">🔑</span>
+              <input id="password" type="text" required placeholder="邮箱密码" autocomplete="current-password" />
+            </div>
+            <button class="ant-btn ant-btn-primary auth-submit" type="submit">
+              <span>登录并查看邮件</span>
+            </button>
+          </form>
+          <div class="auth-tip" id="tip">目标路径：/web/{邮箱----邮箱密码}</div>
+        </div>
+      </div>
+    </main>
   </div>
 
   <script>
@@ -3667,6 +3437,9 @@ async def admin_logout(request: Request):
 @app.get("/admin/panel/")
 async def admin_panel():
     """后台管理系统入口（需鉴权）"""
+    react_admin_index = "static/admin/index.html"
+    if os.path.exists(react_admin_index):
+        return FileResponse(react_admin_index)
     return FileResponse("static/index.html")
 
 @app.delete("/cache/{email_id}")
@@ -3713,12 +3486,12 @@ if __name__ == "__main__":
     import uvicorn
 
     # 启动配置
-    HOST = "0.0.0.0"
-    PORT = 8000
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
 
     logger.info(f"Starting Outlook Email Management System on {HOST}:{PORT}")
-    logger.info("Access the web interface at: http://localhost:8000")
-    logger.info("Access the API documentation at: http://localhost:8000/docs")
+    logger.info(f"Access the web interface at: http://localhost:{PORT}")
+    logger.info(f"Access the API documentation at: http://localhost:{PORT}/docs")
 
     uvicorn.run(
         app,

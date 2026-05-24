@@ -26,15 +26,27 @@ fi
 load_env
 cd "$ROOT_DIR"
 
-export DATABASE_URL="${DATABASE_URL_LOCAL:-postgresql://outlook:outlook@localhost:5432/outlook_manager}"
-export REDIS_URL="${REDIS_URL_LOCAL:-redis://localhost:6379/0}"
+mkdir -p "$ROOT_DIR/data"
 
-PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="python3"
+export DATABASE_URL="${DATABASE_URL_LOCAL:-sqlite:///$ROOT_DIR/data/outlook-manager.db}"
+export REDIS_URL="${REDIS_URL_LOCAL-}"
+
+RUNNER=()
+if command -v uv >/dev/null 2>&1; then
+  RUNNER=(uv run python)
+else
+  PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    PYTHON_BIN="python3"
+  fi
+  RUNNER=("$PYTHON_BIN")
 fi
 
 echo "Starting local app..."
 echo "DATABASE_URL=$DATABASE_URL"
-echo "REDIS_URL=$REDIS_URL"
-exec "$PYTHON_BIN" main.py
+if [[ -n "$REDIS_URL" ]]; then
+  echo "REDIS_URL=$REDIS_URL"
+else
+  echo "REDIS_URL=(disabled)"
+fi
+exec "${RUNNER[@]}" main.py

@@ -8,7 +8,7 @@
 
 - **📧 邮件管理**: 支持查看、搜索、过滤邮件
 - **👥 多账户管理**: 支持添加和管理多个Outlook邮箱账户
-- **📦 批量操作**: 支持批量添加邮箱账户
+- **📦 批量操作**: 支持单行或多行添加邮箱账户
 - **🔍 智能搜索**: 实时搜索邮件标题、发件人等信息
 - **📊 数据统计**: 显示邮件统计信息（总数、未读、今日邮件等）
 - **📤 数据导出**: 支持导出邮件列表为CSV格式
@@ -43,7 +43,10 @@
 
 ### 📋 系统要求
 
-- Python 3.8+
+- Python 3.11+
+- uv
+- Node.js 20+
+- npm
 - 现代浏览器（Chrome、Firefox、Safari、Edge）
 - 网络连接（用于访问Outlook IMAP和Microsoft Graph服务）
 
@@ -55,7 +58,11 @@ git clone <repository-url>
 cd OutlookManager
 
 # 安装Python依赖
-pip install -r requirements.txt
+uv sync
+
+# 安装并构建管理后台前端
+npm install
+npm run frontend:build
 ```
 
 ### ⚙️ 配置设置
@@ -80,39 +87,46 @@ pip install -r requirements.txt
 #### 开发环境
 
 ```bash
-# 启动开发服务器
-python main.py
+# 本地默认使用 SQLite: ./data/outlook-manager.db
+cp .env.example .env
+./start.sh
 
-# 或使用uvicorn
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+# 如需后端热重载，先加载 .env，再使用 uvicorn
+set -a; source .env; set +a
+export DATABASE_URL="${DATABASE_URL_LOCAL:-sqlite:///./data/outlook-manager.db}"
+export REDIS_URL="${REDIS_URL_LOCAL-}"
+uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# 如需前端热重载，另开一个终端
+npm run frontend:dev
 ```
 
 #### 生产环境
 
 ```bash
 # 使用gunicorn启动
-pip install gunicorn
-gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8001
+uv run --with gunicorn gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
 
 # 或使用uvicorn
-uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
+uv run uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
 ### 🌐 访问系统
 
 启动成功后，在浏览器中访问：
-- **Web界面**: http://localhost:8001
-- **API文档**: http://localhost:8001/docs
-- **API状态**: http://localhost:8001/api
+- **Web界面**: http://localhost:8000
+- **管理后台**: http://localhost:8000/admin
+- **API文档**: http://localhost:8000/docs
+- **API状态**: http://localhost:8000/api
 
 ## 📚 使用指南
 
 ### 1️⃣ 添加邮箱账户
 
 1. 点击左侧菜单"添加账户"
-2. 填写邮箱地址、刷新令牌和客户端ID（系统会自动识别使用 IMAP 或 Graph 模式）
-3. 点击"测试连接"验证配置
-4. 点击"添加账户"完成添加
+2. 每行填写一个账户，支持 `邮箱----密码----刷新令牌----客户端ID` 或 `邮箱----密码----客户端ID----刷新令牌`
+3. 选择认证模式并点击"验证格式"
+4. 点击"开始添加"完成导入
 
 ### 2️⃣ 查看邮件
 
@@ -121,14 +135,7 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 3. 使用过滤器按条件筛选
 4. 点击邮件查看详细内容
 
-### 3️⃣ 批量添加账户
-
-1. 点击左侧菜单"批量添加"
-2. 按格式输入账户信息（支持两种顺序）：`邮箱----密码----刷新令牌----客户端ID` 或 `邮箱----密码----客户端ID----刷新令牌`
-3. 点击"验证格式"检查数据
-4. 点击"开始批量添加"执行
-
-### 4️⃣ API调用
+### 3️⃣ API调用
 
 查看"API管理"页面获取完整的接口文档，支持：
 - 获取邮箱列表：`GET /accounts`
@@ -143,12 +150,15 @@ uvicorn main:app --host 0.0.0.0 --port 8001 --workers 4
 # 构建镜像
 docker build -t outlook-manager .
 
-# 运行容器
+# 运行单容器，本地数据保存到 ./data
 docker run -d \
   --name outlook-manager \
-  -p 8001:8001 \
-  -v $(pwd)/accounts.json:/app/accounts.json \
+  -p 8000:8000 \
+  -v $(pwd)/data:/app/data \
   outlook-manager
+
+# 或启动完整 PostgreSQL + Redis 栈
+docker compose up --build
 ```
 
 ### ☁️ 云服务器部署
@@ -169,7 +179,7 @@ scp -r . user@server:/opt/outlook-manager/
 
 # 安装依赖
 cd /opt/outlook-manager
-pip3 install -r requirements.txt
+uv sync
 ```
 
 #### 3. 配置Nginx
@@ -179,7 +189,7 @@ server {
     server_name your-domain.com;
 
     location / {
-        proxy_pass http://127.0.0.1:8001;
+        proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
@@ -201,7 +211,7 @@ After=network.target
 Type=exec
 User=www-data
 WorkingDirectory=/opt/outlook-manager
-ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8001
+ExecStart=/usr/bin/env uv run uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=always
 
 [Install]
@@ -220,7 +230,7 @@ sudo systemctl start outlook-manager
 #### 1. 数据库优化
 ```bash
 # 如果使用SQLite，定期优化
-sqlite3 accounts.db "VACUUM;"
+sqlite3 ./data/outlook-manager.db "VACUUM;"
 ```
 
 #### 2. 缓存配置
@@ -242,10 +252,15 @@ gunicorn main:app -w 8 -k uvicorn.workers.UvicornWorker
 ```
 OutlookManager/
 ├── main.py              # 主应用文件
+├── pyproject.toml       # uv 项目配置
+├── package.json         # React 管理后台依赖和脚本
+├── vite.config.js       # 前端构建配置
+├── frontend/            # Ant Design Pro + React 管理后台源码
 ├── static/
-│   └── index.html       # 前端页面
-├── accounts.json        # 账户数据文件
-├── requirements.txt     # Python依赖
+│   ├── admin/           # React 管理后台构建产物
+│   └── index.html       # 旧版后台页面（构建产物缺失时回退）
+├── data/                # 本地 SQLite 数据目录
+├── requirements.txt     # Docker兼容依赖清单
 ├── README.md           # 项目文档
 └── docs/               # 文档和图片
     └── images/
@@ -253,11 +268,19 @@ OutlookManager/
 
 ### 🔧 开发环境设置
 ```bash
-# 安装开发依赖
-pip install -r requirements-dev.txt
+# 安装依赖
+uv sync
+npm install
+npm run frontend:build
 
-# 启动开发服务器（热重载）
-uvicorn main:app --reload --host 0.0.0.0 --port 8001
+# 启动后端开发服务器（热重载）
+set -a; source .env; set +a
+export DATABASE_URL="${DATABASE_URL_LOCAL:-sqlite:///./data/outlook-manager.db}"
+export REDIS_URL="${REDIS_URL_LOCAL-}"
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# 启动前端开发服务器（热重载，自动代理到 8000 后端）
+npm run frontend:dev
 ```
 
 ### 🧪 测试
