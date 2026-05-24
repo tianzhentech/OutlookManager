@@ -331,6 +331,7 @@ export function AccountsPage({ refreshKey, onOpenEmails, onRefresh }) {
       dataIndex: 'status',
       search: false,
       width: 110,
+      responsive: ['sm'],
       render: (_, row) => statusBadge(row.status),
     },
     {
@@ -338,6 +339,7 @@ export function AccountsPage({ refreshKey, onOpenEmails, onRefresh }) {
       dataIndex: 'auth_mode',
       search: false,
       width: 92,
+      responsive: ['md'],
       render: (_, row) => <Tag color="blue">{(row.auth_mode || 'imap').toUpperCase()}</Tag>,
     },
     {
@@ -346,12 +348,14 @@ export function AccountsPage({ refreshKey, onOpenEmails, onRefresh }) {
       search: false,
       ellipsis: true,
       copyable: true,
+      responsive: ['xl'],
     },
     {
       title: 'AT 过期',
       dataIndex: 'access_token_expires_at',
       search: false,
       width: 180,
+      responsive: ['lg'],
       render: (_, row) => formatDateTime(row.access_token_expires_at),
     },
     {
@@ -359,44 +363,59 @@ export function AccountsPage({ refreshKey, onOpenEmails, onRefresh }) {
       dataIndex: 'refresh_token_expires_at',
       search: false,
       width: 180,
+      responsive: ['lg'],
       render: (_, row) => formatDateTime(row.refresh_token_expires_at),
     },
     {
       title: '操作',
       valueType: 'option',
-      width: 300,
-      render: (_, row) => [
-        <Tooltip key="emails" title="查看邮件">
-          <Button icon={<InboxOutlined />} type="link" onClick={() => onOpenEmails(row.email_id)}>
-            邮件
-          </Button>
-        </Tooltip>,
-        <Button
-          key="edit"
-          icon={<EditOutlined />}
-          type="link"
-          onClick={() => {
-            setEditingEmail(row.email_id);
-            setEditOpen(true);
-          }}
-        >
-          编辑
-        </Button>,
-        <Popconfirm
-          key="refresh"
-          title="刷新该账户 RT/AT？"
-          okText="刷新"
-          cancelText="取消"
-          onConfirm={() => refreshAccount(row.email_id)}
-        >
-          <Button icon={<ReloadOutlined />} type="link">
-            刷新
-          </Button>
-        </Popconfirm>,
-        <Button key="delete" icon={<DeleteOutlined />} type="link" danger onClick={() => deleteAccount(row.email_id)}>
-          删除
-        </Button>,
-      ],
+      width: 184,
+      fixed: 'right',
+      render: (_, row) => (
+        <Space size={4} className="account-row-actions">
+          <Tooltip title="查看邮件">
+            <Button
+              aria-label="查看邮件"
+              className="account-action-btn"
+              icon={<InboxOutlined />}
+              type="text"
+              onClick={() => onOpenEmails(row.email_id)}
+            />
+          </Tooltip>
+          <Tooltip title="编辑账户">
+            <Button
+              aria-label="编辑账户"
+              className="account-action-btn"
+              icon={<EditOutlined />}
+              type="text"
+              onClick={() => {
+                setEditingEmail(row.email_id);
+                setEditOpen(true);
+              }}
+            />
+          </Tooltip>
+          <Popconfirm
+            title="刷新该账户 RT/AT？"
+            okText="刷新"
+            cancelText="取消"
+            onConfirm={() => refreshAccount(row.email_id)}
+          >
+            <Tooltip title="刷新 RT/AT">
+              <Button aria-label="刷新 RT/AT" className="account-action-btn" icon={<ReloadOutlined />} type="text" />
+            </Tooltip>
+          </Popconfirm>
+          <Tooltip title="删除账户">
+            <Button
+              aria-label="删除账户"
+              className="account-action-btn"
+              danger
+              icon={<DeleteOutlined />}
+              type="text"
+              onClick={() => deleteAccount(row.email_id)}
+            />
+          </Tooltip>
+        </Space>
+      ),
     },
   ];
 
@@ -409,6 +428,7 @@ export function AccountsPage({ refreshKey, onOpenEmails, onRefresh }) {
         columns={columns}
         cardBordered
         className="admin-table"
+        scroll={{ x: 760 }}
         request={async (params) => {
           const query = buildQuery({
             page: params.current || 1,

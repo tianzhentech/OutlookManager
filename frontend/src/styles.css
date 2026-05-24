@@ -51,6 +51,26 @@ body {
   border-radius: 6px;
 }
 
+.admin-table .ant-table-cell-fix-right {
+  background: #ffffff;
+}
+
+.admin-table .ant-table-cell-fix-right-first::after {
+  box-shadow: inset -10px 0 8px -8px rgba(5, 5, 5, 0.12);
+}
+
+.account-row-actions {
+  display: inline-flex;
+  width: 136px;
+  justify-content: space-between;
+}
+
+.account-action-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+}
+
 .form-shell {
   max-width: 900px;
 }
