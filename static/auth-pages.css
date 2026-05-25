@@ -297,6 +297,10 @@ body.auth-page {
     color: var(--auth-text);
 }
 
+.ant-alert[hidden] {
+    display: none !important;
+}
+
 .ant-alert-icon {
     width: 16px;
     height: 16px;
