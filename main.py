@@ -273,6 +273,12 @@ class UpdateTagsRequest(BaseModel):
     tags: List[str]
 
 
+class WebLoginValidationRequest(BaseModel):
+    """Web快速取件登录校验请求"""
+    email: EmailStr
+    mailbox_password: str
+
+
 class TokenRefreshSettingsUpdateRequest(BaseModel):
     """更新定时刷新设置请求"""
     enabled: bool
@@ -3124,7 +3130,7 @@ async def get_web_account_credentials(credential_path: str) -> AccountCredential
         lookup_email = normalize_web_lookup_email(email_id)
         raise HTTPException(
             status_code=404,
-            detail=f"Account not found in database for {lookup_email}"
+            detail=f"未找到邮箱 {lookup_email}，或邮箱密码不匹配。"
         )
     return credentials
 
@@ -3183,6 +3189,106 @@ def serve_react_frontend_index() -> FileResponse:
     raise HTTPException(status_code=500, detail="React frontend build not found. Run npm run frontend:build first.")
 
 
+def render_web_mailbox_not_found_page(email_id: str, detail: str, status_code: int = 404) -> HTMLResponse:
+    """Web快速取件账户未找到页面。"""
+    lookup_email = normalize_web_lookup_email(email_id) if email_id else ""
+    safe_email = escape(lookup_email or "未知邮箱")
+    safe_detail = escape(detail or "未找到对应的邮箱账户，或邮箱密码不匹配。")
+
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>邮箱未找到</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/auth-pages.css" />
+</head>
+<body class="auth-page auth-page-web">
+  <div class="auth-layout-shell">
+    <aside class="auth-aside auth-aside-web">
+      <div class="auth-brand">
+        <span class="auth-logo">IQ</span>
+        <span>Inbox Quick View</span>
+      </div>
+      <h1>邮箱快速查看</h1>
+      <p>当前链接没有匹配到后台已添加的 Outlook 邮箱账户。请检查邮箱地址、邮箱密码，或先在后台添加账户。</p>
+      <div class="auth-metrics">
+        <div>
+          <strong>404</strong>
+          <span>未找到</span>
+        </div>
+        <div>
+          <strong>Alias</strong>
+          <span>支持别名识别</span>
+        </div>
+        <div>
+          <strong>Outlook</strong>
+          <span>账户匹配</span>
+        </div>
+      </div>
+    </aside>
+    <main class="auth-main">
+      <div class="ant-card auth-card">
+        <div class="ant-card-body">
+          <div class="auth-card-header">
+            <span class="auth-card-icon auth-card-icon-error">!</span>
+            <div>
+              <h2>未找到邮箱</h2>
+              <p>没有匹配到可以打开的邮箱账户。</p>
+            </div>
+          </div>
+          <div class="ant-alert ant-alert-error auth-error" role="alert">
+            <span class="ant-alert-icon">!</span>
+            <div class="ant-alert-content">
+              <div class="ant-alert-message">{safe_detail}</div>
+            </div>
+          </div>
+          <div class="auth-tip">
+            匹配邮箱：{safe_email}
+          </div>
+          <a class="ant-btn ant-btn-primary auth-submit auth-link-button" href="/">
+            返回邮箱登录
+          </a>
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content, status_code=status_code)
+
+
+@app.post("/web-login/validate")
+async def validate_web_login(request: WebLoginValidationRequest):
+    """邮箱快速取件登录前校验。"""
+    credentials = get_account_credentials_by_email_and_password(
+        str(request.email),
+        request.mailbox_password
+    )
+    lookup_email = normalize_web_lookup_email(str(request.email))
+
+    if not credentials:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "email_id": lookup_email,
+                "detail": f"未找到邮箱 {lookup_email}，或邮箱密码不匹配。"
+            }
+        )
+
+    return {
+        "ok": True,
+        "email_id": str(credentials.email),
+        "detail": "邮箱匹配成功。"
+    }
+
+
 @app.get("/web/{credential_path}", response_class=HTMLResponse)
 async def web_mailbox(
     credential_path: str
@@ -3192,6 +3298,19 @@ async def web_mailbox(
     访问路径示例：
     - /web/user@outlook.com----mailbox_password
     """
+    try:
+        await resolve_web_mailbox_source(credential_path)
+    except HTTPException as e:
+        email_id = ""
+        try:
+            email_id, _ = parse_web_credential_path(credential_path)
+        except HTTPException:
+            pass
+        return render_web_mailbox_not_found_page(
+            email_id=email_id,
+            detail=str(e.detail),
+            status_code=e.status_code if e.status_code in {400, 404} else 404
+        )
     return serve_react_frontend_index()
 
 
@@ -3332,6 +3451,19 @@ async def web_mailbox_message_detail(credential_path: str, message_id: str):
 @app.get("/web/{credential_path}/detail/{message_id:path}", response_class=HTMLResponse)
 async def web_mailbox_detail(credential_path: str, message_id: str):
     """Web快速查看邮件详情React入口。"""
+    try:
+        await resolve_web_mailbox_source(credential_path)
+    except HTTPException as e:
+        email_id = ""
+        try:
+            email_id, _ = parse_web_credential_path(credential_path)
+        except HTTPException:
+            pass
+        return render_web_mailbox_not_found_page(
+            email_id=email_id,
+            detail=str(e.detail),
+            status_code=e.status_code if e.status_code in {400, 404} else 404
+        )
     return serve_react_frontend_index()
 
 
@@ -3384,6 +3516,12 @@ async def root():
               <p>登录后将跳转到邮件网页查看页。</p>
             </div>
           </div>
+          <div class="ant-alert ant-alert-error auth-error" id="webLoginError" role="alert" hidden>
+            <span class="ant-alert-icon">!</span>
+            <div class="ant-alert-content">
+              <div class="ant-alert-message" id="webLoginErrorText"></div>
+            </div>
+          </div>
           <form class="auth-form" id="webLoginForm">
             <label class="ant-form-item-required" for="email">邮箱地址</label>
             <div class="ant-input-affix-wrapper">
@@ -3395,8 +3533,8 @@ async def root():
               <span class="ant-input-prefix">🔑</span>
               <input id="password" type="text" required placeholder="邮箱密码" autocomplete="current-password" />
             </div>
-            <button class="ant-btn ant-btn-primary auth-submit" type="submit">
-              <span>登录并查看邮件</span>
+            <button class="ant-btn ant-btn-primary auth-submit" id="webLoginSubmit" type="submit">
+              <span id="webLoginSubmitText">登录并查看邮件</span>
             </button>
           </form>
           <div class="auth-tip" id="tip">目标路径：/web/{邮箱----邮箱密码}</div>
@@ -3408,6 +3546,10 @@ async def root():
   <script>
     const form = document.getElementById("webLoginForm");
     const tip = document.getElementById("tip");
+    const errorBox = document.getElementById("webLoginError");
+    const errorText = document.getElementById("webLoginErrorText");
+    const submitButton = document.getElementById("webLoginSubmit");
+    const submitText = document.getElementById("webLoginSubmitText");
 
     function normalizeWebLookupEmail(value) {
       const normalized = String(value || "").trim().toLowerCase();
@@ -3425,16 +3567,57 @@ async def root():
       return `${localPart}@${domain}`;
     }
 
-    form.addEventListener("submit", function (e) {
+    function showLoginError(message) {
+      errorText.textContent = message || "未找到邮箱账户，或邮箱密码不匹配。";
+      errorBox.hidden = false;
+    }
+
+    function hideLoginError() {
+      errorText.textContent = "";
+      errorBox.hidden = true;
+    }
+
+    form.addEventListener("submit", async function (e) {
       e.preventDefault();
+      hideLoginError();
       const email = normalizeWebLookupEmail(document.getElementById("email").value);
       const password = document.getElementById("password").value.trim();
       if (!email || !password) {
         return;
       }
-      const credential = `${email}----${password}`;
-      tip.textContent = `目标路径：/web/${credential}`;
-      window.location.href = `/web/${encodeURIComponent(credential)}`;
+
+      submitButton.disabled = true;
+      submitText.textContent = "正在校验...";
+
+      try {
+        const response = await fetch("/web-login/validate", {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            email,
+            mailbox_password: password
+          })
+        });
+        const payload = await response.json().catch(() => ({}));
+
+        if (!response.ok || !payload.ok) {
+          const detail = typeof payload.detail === "string" ? payload.detail : "请输入正确的邮箱地址和邮箱密码。";
+          showLoginError(detail);
+          return;
+        }
+
+        const credential = `${payload.email_id || email}----${password}`;
+        tip.textContent = `目标路径：/web/${credential}`;
+        window.location.href = `/web/${encodeURIComponent(credential)}`;
+      } catch (_) {
+        showLoginError("无法连接服务器，请稍后重试。");
+      } finally {
+        submitButton.disabled = false;
+        submitText.textContent = "登录并查看邮件";
+      }
     });
   </script>
 </body>
