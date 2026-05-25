@@ -3516,7 +3516,7 @@ async def root():
               <p>登录后将跳转到邮件网页查看页。</p>
             </div>
           </div>
-          <div class="ant-alert ant-alert-error auth-error" id="webLoginError" role="alert" hidden>
+          <div class="ant-alert ant-alert-error auth-error" id="webLoginError" role="alert" hidden style="display: none;">
             <span class="ant-alert-icon">!</span>
             <div class="ant-alert-content">
               <div class="ant-alert-message" id="webLoginErrorText"></div>
@@ -3570,11 +3570,13 @@ async def root():
     function showLoginError(message) {
       errorText.textContent = message || "未找到邮箱账户，或邮箱密码不匹配。";
       errorBox.hidden = false;
+      errorBox.style.display = "flex";
     }
 
     function hideLoginError() {
       errorText.textContent = "";
       errorBox.hidden = true;
+      errorBox.style.display = "none";
     }
 
     form.addEventListener("submit", async function (e) {
